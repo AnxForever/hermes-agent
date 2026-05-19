@@ -156,6 +156,29 @@ _MARKDOWN_HINT_RE = re.compile(
 # Detect markdown tables: a line starting with | followed by a separator line.
 # Feishu post-type 'md' elements do not render tables, so we force text mode.
 _MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
+# "label：value" or "label: value" — Chinese/ASCII colon followed by a value.
+# Used as a fallback signal that the reply is structured even when no explicit
+# markdown markers are present (typical of data-analysis replies from M2 with
+# reasoning_effort=none, which often omits bold/list markup).
+_STRUCTURED_LINE_RE = re.compile(r"^\s*\S[^\n：:]{0,40}[：:]\s*\S")
+
+
+def _looks_structured(content: str) -> bool:
+    """True if ``content`` reads like a structured multi-line reply.
+
+    The heuristic: 2 or more non-empty lines, at least 2 of which look like
+    ``label: value`` (either ASCII or full-width colon). Tightening the
+    threshold to 2 keeps single-line greetings (``你好：欢迎``) from being
+    routed through the post renderer; loosening it to 2 catches the typical
+    data-analysis preamble that the model emits without any markdown.
+    """
+    if not content:
+        return False
+    lines = [ln for ln in content.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return False
+    matches = sum(1 for ln in lines if _STRUCTURED_LINE_RE.match(ln))
+    return matches >= 2
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
@@ -4414,9 +4437,16 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
         # Feishu post-type 'md' elements do not render markdown tables; the post
         # row builder isolates tables into plain-text rows so surrounding prose
-        # still renders as markdown. Route through post whenever markdown hints
-        # or tables exist, and fall back to plain text only for pure prose.
-        if _MARKDOWN_HINT_RE.search(content) or _MARKDOWN_TABLE_RE.search(content):
+        # still renders as markdown. Route through post whenever markdown hints,
+        # tables, or a *structured* multi-line response are present — the last
+        # case catches data-analysis replies like "数据形状：1000 行 × 5 列\n列：…"
+        # that use Chinese colons + linebreaks but no explicit markdown markers.
+        # Without that, Feishu would render the raw text on one greyed line.
+        if (
+            _MARKDOWN_HINT_RE.search(content)
+            or _MARKDOWN_TABLE_RE.search(content)
+            or _looks_structured(content)
+        ):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
