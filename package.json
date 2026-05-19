@@ -3,8 +3,17 @@
   "version": "1.0.0",
   "description": "An AI agent with advanced tool-calling capabilities, featuring a flexible toolsets system for organizing and managing tools.",
   "private": true,
+  "workspaces": [
+    "web",
+    "web-chat",
+    "packages/*"
+  ],
   "scripts": {
-    "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'"
+    "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'",
+    "build:web": "npm run build --workspace web",
+    "build:web-chat": "npm run build --workspace web-chat",
+    "dev:web": "npm run dev --workspace web",
+    "dev:web-chat": "npm run dev --workspace web-chat"
   },
   "repository": {
     "type": "git",

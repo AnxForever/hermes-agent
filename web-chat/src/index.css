@@ -1,0 +1,18 @@
+@import "tailwindcss";
+@import "@hermes/design-tokens/tokens.css";
+
+:root {
+  color-scheme: light dark;
+  font-family: var(--hermes-font-sans);
+  font-size: var(--hermes-font-size-base);
+  line-height: var(--hermes-line-height);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--hermes-bg);
+  color: var(--hermes-fg);
+}

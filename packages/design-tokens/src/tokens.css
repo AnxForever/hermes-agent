@@ -1,0 +1,80 @@
+/*
+ * Hermes shared design tokens.
+ *
+ * Source of truth for colors, typography, and spacing that should look
+ * the same across the admin dashboard (`web/`) and the user-facing chat
+ * (`web-chat/`). Importing apps add their own component styles on top,
+ * but tokens live here so theme drift between the two surfaces stops at
+ * one file.
+ *
+ * Usage (per app entry CSS):
+ *   @import "@hermes/design-tokens/tokens.css";
+ *
+ * The web dashboard's own theme system (web/src/themes/) is richer
+ * (palette + typography + layout switching at runtime). Treat these
+ * tokens as the *fallback* / *neutral default*; the dashboard's
+ * runtime theme can override individual variables if it wants.
+ */
+
+:root {
+  /* Brand palette — neutral dark. Light-mode override below. */
+  --hermes-bg: #0a0a0a;
+  --hermes-bg-elevated: #131313;
+  --hermes-bg-input: #191919;
+  --hermes-border: #2a2a2a;
+  --hermes-border-strong: #404040;
+  --hermes-fg: #fafafa;
+  --hermes-fg-muted: #a3a3a3;
+  --hermes-fg-subtle: #6b6b6b;
+
+  --hermes-accent: #ffffff;
+  --hermes-accent-fg: #0a0a0a;
+
+  --hermes-danger: #ef4444;
+  --hermes-danger-bg: rgba(239, 68, 68, 0.12);
+  --hermes-success: #10b981;
+  --hermes-warning: #f59e0b;
+
+  /* Typography */
+  --hermes-font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --hermes-font-mono:
+    ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --hermes-font-size-base: 14px;
+  --hermes-line-height: 1.55;
+
+  /* Spacing scale — mirrors Tailwind's default scale */
+  --hermes-space-1: 4px;
+  --hermes-space-2: 8px;
+  --hermes-space-3: 12px;
+  --hermes-space-4: 16px;
+  --hermes-space-6: 24px;
+  --hermes-space-8: 32px;
+
+  /* Radii */
+  --hermes-radius-sm: 4px;
+  --hermes-radius-md: 8px;
+  --hermes-radius-lg: 12px;
+  --hermes-radius-full: 9999px;
+
+  /* Shadows */
+  --hermes-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --hermes-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.3);
+  --hermes-shadow-xl: 0 20px 40px rgba(0, 0, 0, 0.45);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --hermes-bg: #ffffff;
+    --hermes-bg-elevated: #fafafa;
+    --hermes-bg-input: #f5f5f5;
+    --hermes-border: #e5e5e5;
+    --hermes-border-strong: #d4d4d4;
+    --hermes-fg: #0a0a0a;
+    --hermes-fg-muted: #525252;
+    --hermes-fg-subtle: #a3a3a3;
+    --hermes-accent: #0a0a0a;
+    --hermes-accent-fg: #ffffff;
+  }
+}

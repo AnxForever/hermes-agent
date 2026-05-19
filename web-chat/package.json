@@ -1,0 +1,33 @@
+{
+  "name": "web-chat",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "User-facing chat web app for the Hermes Agent — talks to the gateway data-plane API (/v1/*).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --port 5173",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@hermes/design-tokens": "*",
+    "@nous-research/ui": "^0.10.0",
+    "@tailwindcss/vite": "^4.2.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.577.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-router-dom": "^7.14.1",
+    "tailwind-merge": "^3.5.0",
+    "tailwindcss": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.2.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.1"
+  }
+}
