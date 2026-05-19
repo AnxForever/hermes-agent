@@ -86,6 +86,25 @@ app = FastAPI(title="Hermes Agent", version=__version__)
 _SESSION_TOKEN = secrets.token_urlsafe(32)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
+# ---------------------------------------------------------------------------
+# Optional admin RBAC. When ``HERMES_DASHBOARD_REQUIRE_LOGIN=1`` is set, the
+# dashboard refuses to inject ``_SESSION_TOKEN`` into the SPA HTML; the SPA
+# must then exchange username + password for a JWT via /api/admin/login
+# (which delegates to ``gateway.platforms.api_auth.AuthStore``) and present
+# it on the ``Authorization`` header for every /api/ call.
+#
+# The JWT path is also accepted when the env var is unset, so dashboards
+# launched in mixed mode (some clients still using the legacy session
+# token, others using JWT) work without flag flips.
+# ---------------------------------------------------------------------------
+_REQUIRE_LOGIN = os.getenv("HERMES_DASHBOARD_REQUIRE_LOGIN", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_DASHBOARD_JWT_KEY = os.getenv("API_SERVER_KEY", "")
+
 # In-browser Chat tab (/chat, /api/pty, …).  Off unless ``hermes dashboard --tui``
 # or HERMES_DASHBOARD_TUI=1.  Set from :func:`start_server`.
 _DASHBOARD_EMBEDDED_CHAT_ENABLED = False
@@ -119,27 +138,95 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
     "/api/dashboard/plugins/rescan",
+    # Admin login flow — anyone can attempt to log in; the AuthStore
+    # decides if the credentials are valid.
+    "/api/admin/login",
 })
 
 
-def _has_valid_session_token(request: Request) -> bool:
-    """True if the request carries a valid dashboard session token.
+def _decode_admin_jwt(authorization_header: str) -> Optional[Dict[str, Any]]:
+    """Decode a Bearer JWT and return the admin user dict, or None.
 
-    The dedicated session header avoids collisions with reverse proxies that
-    already use ``Authorization`` (for example Caddy ``basic_auth``). We still
-    accept the legacy Bearer path for backward compatibility with older
-    dashboard bundles.
+    Returns ``None`` for any failure mode (missing key, malformed token,
+    expired, non-admin role) so callers can treat it as "JWT path
+    didn't apply" without distinguishing error types at this layer.
     """
+    if not _DASHBOARD_JWT_KEY:
+        return None
+    if not authorization_header or not authorization_header.startswith("Bearer "):
+        return None
+    token = authorization_header[len("Bearer "):].strip()
+    if not token:
+        return None
+    try:
+        # Local import: api_auth is a sibling package; avoid pulling it
+        # at module import time so dashboards built without the gateway
+        # surface keep starting.
+        from gateway.platforms.api_auth import decode_jwt
+    except Exception:
+        return None
+    payload = decode_jwt(token, signing_key=_DASHBOARD_JWT_KEY)
+    if payload is None:
+        return None
+    if payload.role != "admin":
+        return None
+    return payload.to_user_dict()
+
+
+def _has_valid_session_token(request: Request) -> bool:
+    """True if the request carries a valid dashboard credential.
+
+    Two paths are accepted:
+
+    1. The legacy ephemeral session token, injected into the SPA HTML at
+       page load. Sent on ``X-Hermes-Session-Token`` (preferred) or as
+       ``Authorization: Bearer <token>`` for back-compat. This path is
+       disabled when ``HERMES_DASHBOARD_REQUIRE_LOGIN=1``.
+
+    2. A JWT signed with the gateway's ``API_SERVER_KEY`` whose claim has
+       ``role=admin``. This is the canonical multi-user path; it requires
+       the dashboard container to share ``API_SERVER_KEY`` with the
+       gateway and to read the gateway's ``response_store.db`` users
+       table (sqlite-on-shared-volume).
+
+    Attaches the authenticated user dict to ``request.state.user`` on
+    success so handlers can read who's calling.
+    """
+    auth_header = request.headers.get("authorization", "")
+    admin_user = _decode_admin_jwt(auth_header)
+    if admin_user is not None:
+        request.state.user = admin_user
+        return True
+
+    if _REQUIRE_LOGIN:
+        # Strict mode — only the JWT path is honored. The legacy session
+        # token is intentionally rejected so a single operator misclick
+        # in localStorage can't escalate to admin.
+        return False
+
     session_header = request.headers.get(_SESSION_HEADER_NAME, "")
     if session_header and hmac.compare_digest(
         session_header.encode(),
         _SESSION_TOKEN.encode(),
     ):
+        request.state.user = {
+            "user_id": "_session_token_",
+            "handle": "_session_token_",
+            "role": "admin",
+            "auth_source": "session_token",
+        }
         return True
 
-    auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
-    return hmac.compare_digest(auth.encode(), expected.encode())
+    if hmac.compare_digest(auth_header.encode(), expected.encode()):
+        request.state.user = {
+            "user_id": "_session_token_",
+            "handle": "_session_token_",
+            "role": "admin",
+            "auth_source": "session_token_bearer",
+        }
+        return True
+    return False
 
 
 def _require_token(request: Request) -> None:
@@ -532,6 +619,111 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
         except Exception:
             continue
     return False, None
+
+
+# ---------------------------------------------------------------------------
+# Admin auth endpoints — JWT login flow shared with the gateway data plane.
+#
+# The dashboard container reads ~/.hermes/response_store.db over a bind
+# mount, so its AuthStore sees the same users table the gateway sees.
+# Tokens issued here also work against /v1/* on :8642 since both servers
+# verify with the same API_SERVER_KEY.
+# ---------------------------------------------------------------------------
+
+
+class _AdminLoginBody(BaseModel):
+    handle: str
+    password: str
+
+
+def _open_auth_store():
+    """Return a fresh AuthStore for this request, or ``None`` on failure.
+
+    Cached at module scope isn't great here because the dashboard process
+    can outlive a single user's session and the sqlite connection has
+    been known to wedge on stale schema migrations. Reopening per request
+    is cheap (SQLite open + ATTACH-less query) and keeps the dashboard
+    decoupled from gateway restarts.
+    """
+    if not _DASHBOARD_JWT_KEY:
+        return None
+    try:
+        from gateway.platforms.api_auth import AuthStore
+        db_path = str(get_hermes_home() / "response_store.db")
+        return AuthStore(db_path)
+    except Exception:
+        _log.exception("AuthStore unavailable")
+        return None
+
+
+@app.post("/api/admin/login")
+async def admin_login(body: _AdminLoginBody):
+    store = _open_auth_store()
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Auth subsystem unavailable. Confirm API_SERVER_KEY is set.",
+        )
+    try:
+        from gateway.platforms.api_auth import (
+            JWT_TTL_SECONDS,
+            encode_jwt,
+            verify_password,
+        )
+        user = store.get_user_by_handle(body.handle.strip())
+        if (
+            user is None
+            or user.disabled
+            or user.role != "admin"
+            or not verify_password(body.password, user.password_hash)
+        ):
+            # Same 401 for missing / disabled / wrong-password / non-admin
+            # so an attacker can't enumerate handles or guess at roles.
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        token, expires_at = encode_jwt(
+            user_id=user.user_id,
+            handle=user.handle,
+            role=user.role,
+            signing_key=_DASHBOARD_JWT_KEY,
+        )
+        try:
+            store.touch_last_seen(user.user_id)
+        except Exception:
+            pass
+        return {
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": JWT_TTL_SECONDS,
+            "expires_at": expires_at,
+            "user": {
+                "user_id": user.user_id,
+                "handle": user.handle,
+                "role": user.role,
+            },
+        }
+    finally:
+        store.close()
+
+
+@app.get("/api/admin/me")
+async def admin_me(request: Request):
+    if not _has_valid_session_token(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    user = getattr(request.state, "user", None) or {}
+    return {
+        "user_id": user.get("user_id"),
+        "handle": user.get("handle"),
+        "role": user.get("role"),
+        "auth_source": user.get("auth_source"),
+        "require_login": _REQUIRE_LOGIN,
+    }
+
+
+@app.post("/api/admin/logout")
+async def admin_logout():
+    # Client-side: drop the JWT from localStorage. The server holds no
+    # blocklist; tokens expire after JWT_TTL_SECONDS.
+    return JSONResponse(status_code=202, content={"status": "accepted"})
 
 
 @app.get("/api/status")

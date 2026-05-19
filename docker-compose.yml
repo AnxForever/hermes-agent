@@ -79,6 +79,12 @@ services:
     environment:
       - HERMES_UID=${HERMES_UID:-1000}
       - HERMES_GID=${HERMES_GID:-1000}
+      # Share the gateway signing key so the dashboard can verify JWTs
+      # issued by /api/admin/login and /v1/auth/login interchangeably.
+      - API_SERVER_KEY=0d8dacaa8a7b8553608ad8d20d15a8157e64e7efd02992cf
+      # Set to 1 to require admin login on the dashboard. Off by default
+      # so existing single-tenant setups keep working without a flag flip.
+      - HERMES_DASHBOARD_REQUIRE_LOGIN=${HERMES_DASHBOARD_REQUIRE_LOGIN:-}
     # Bind 0.0.0.0 inside the container so Docker port mapping can forward
     # --host 0.0.0.0. Port mapped to 127.0.0.1:9119 on host for security.
     command: ["dashboard", "--host", "0.0.0.0", "--no-open", "--insecure"]

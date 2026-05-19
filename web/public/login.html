@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hermes Dashboard · Sign in</title>
+    <style>
+      /*
+       * Standalone login form for the admin dashboard. Kept off the
+       * React bundle so it loads even before npm install / build, and
+       * so a broken SPA never traps an operator on a blank screen.
+       */
+      :root {
+        color-scheme: dark;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+          Roboto, "Helvetica Neue", Arial, sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #0a0a0a;
+        color: #fafafa;
+      }
+      form {
+        width: 360px;
+        max-width: calc(100vw - 32px);
+        padding: 28px;
+        border: 1px solid #2a2a2a;
+        background: #131313;
+        border-radius: 12px;
+        box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45);
+      }
+      h1 {
+        margin: 0 0 4px;
+        font-size: 18px;
+      }
+      p.subtitle {
+        margin: 0 0 20px;
+        color: #a3a3a3;
+        font-size: 13px;
+      }
+      label {
+        display: block;
+        margin: 14px 0 6px;
+        font-size: 12px;
+        color: #d4d4d4;
+      }
+      input {
+        width: 100%;
+        padding: 10px 12px;
+        border-radius: 6px;
+        border: 1px solid #2a2a2a;
+        background: #191919;
+        color: #fafafa;
+        font: inherit;
+        outline: none;
+        box-sizing: border-box;
+      }
+      input:focus {
+        border-color: #6b6b6b;
+      }
+      button {
+        margin-top: 18px;
+        width: 100%;
+        padding: 10px;
+        border-radius: 6px;
+        border: 0;
+        background: #fafafa;
+        color: #0a0a0a;
+        font: inherit;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .error {
+        margin-top: 14px;
+        padding: 8px 10px;
+        border: 1px solid rgba(239, 68, 68, 0.5);
+        background: rgba(239, 68, 68, 0.1);
+        color: #fca5a5;
+        border-radius: 6px;
+        font-size: 12px;
+        display: none;
+      }
+      .error.visible {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <form id="login">
+      <h1>Hermes Dashboard</h1>
+      <p class="subtitle">Sign in to manage the agent.</p>
+
+      <label for="handle">Handle</label>
+      <input
+        id="handle"
+        name="handle"
+        autocomplete="username"
+        autofocus
+        required
+      />
+
+      <label for="password">Password</label>
+      <input
+        id="password"
+        type="password"
+        name="password"
+        autocomplete="current-password"
+        required
+      />
+
+      <div class="error" id="error"></div>
+      <button type="submit" id="submit">Sign in</button>
+    </form>
+
+    <script>
+      const form = document.getElementById("login");
+      const errorEl = document.getElementById("error");
+      const submitBtn = document.getElementById("submit");
+
+      function showError(msg) {
+        errorEl.textContent = msg;
+        errorEl.classList.add("visible");
+      }
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        errorEl.classList.remove("visible");
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Signing in…";
+
+        const handle = document.getElementById("handle").value.trim();
+        const password = document.getElementById("password").value;
+        try {
+          const res = await fetch("/api/admin/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ handle, password }),
+          });
+          if (!res.ok) {
+            showError(
+              res.status === 401
+                ? "Invalid credentials."
+                : `Login failed (${res.status}).`,
+            );
+            return;
+          }
+          const data = await res.json();
+          localStorage.setItem("hermes.admin_jwt", data.access_token);
+          // Bounce back to the dashboard. The SPA picks up the JWT
+          // from localStorage on the next fetch.
+          window.location.href = "/";
+        } catch (err) {
+          showError(err && err.message ? err.message : "Network error.");
+        } finally {
+          submitBtn.disabled = false;
+          submitBtn.textContent = "Sign in";
+        }
+      });
+    </script>
+  </body>
+</html>

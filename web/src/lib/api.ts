@@ -30,6 +30,29 @@ declare global {
 let _sessionToken: string | null = null;
 const SESSION_HEADER = "X-Hermes-Session-Token";
 
+// When HERMES_DASHBOARD_REQUIRE_LOGIN=1 is set on the dashboard server,
+// the legacy session token is no longer injected into the HTML. Instead
+// the operator logs in via /login.html, which stores a JWT under this
+// localStorage key. fetchJSON below sends it as a Bearer header on every
+// /api/* call.
+const JWT_STORAGE_KEY = "hermes.admin_jwt";
+
+function readStoredJwt(): string | null {
+  try {
+    return localStorage.getItem(JWT_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function clearStoredAdminJwt(): void {
+  try {
+    localStorage.removeItem(JWT_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 function setSessionHeader(headers: Headers, token: string): void {
   if (!headers.has(SESSION_HEADER)) {
     headers.set(SESSION_HEADER, token);
@@ -37,13 +60,30 @@ function setSessionHeader(headers: Headers, token: string): void {
 }
 
 export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
-  // Inject the session token into all /api/ requests.
+  // Inject either the legacy session token (default) or a stored admin
+  // JWT (REQUIRE_LOGIN mode) into all /api/ requests. The dashboard
+  // backend accepts whichever is presented.
   const headers = new Headers(init?.headers);
   const token = window.__HERMES_SESSION_TOKEN__;
   if (token) {
     setSessionHeader(headers, token);
   }
+  const jwt = readStoredJwt();
+  if (jwt && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${jwt}`);
+  }
   const res = await fetch(`${BASE}${url}`, { ...init, headers });
+  if (res.status === 401 && url.startsWith("/api/")) {
+    // Token expired or never provided. If we're in JWT mode (stored
+    // JWT present but rejected, OR no session token injected), bounce
+    // to the login page.
+    if (jwt || !token) {
+      clearStoredAdminJwt();
+      if (typeof window !== "undefined" && window.location.pathname !== "/login.html") {
+        window.location.href = `${BASE}/login.html`;
+      }
+    }
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status}: ${text}`);
