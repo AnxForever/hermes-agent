@@ -1052,6 +1052,33 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         return web.json_response({"status": "accepted"}, status=202)
 
+    def _audit(
+        self,
+        request: "web.Request",
+        action: str,
+        *,
+        target_kind: Optional[str] = None,
+        target_id: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Best-effort audit log write. Never raises."""
+        if self._auth_store is None:
+            return
+        try:
+            ip = request.headers.get("X-Forwarded-For", "") or (
+                request.remote or ""
+            )
+            self._auth_store.record_audit(
+                actor=request.get("user"),
+                action=action,
+                target_kind=target_kind,
+                target_id=target_id,
+                payload=payload,
+                ip=ip.split(",")[0].strip() if ip else None,
+            )
+        except Exception:
+            logger.debug("audit write failed for %s", action, exc_info=True)
+
     # ---- /v1/skills (user-scoped) ------------------------------------
 
     def _require_user(
@@ -1160,6 +1187,11 @@ class APIServerAdapter(BasePlatformAdapter):
             skill_name=name,
             enabled=bool(body["enabled"]),
         )
+        self._audit(
+            request, "skill.toggle",
+            target_kind="skill", target_id=name,
+            payload={"enabled": bool(body["enabled"])},
+        )
         return web.json_response({"name": name, "enabled": bool(body["enabled"])})
 
     # ---- /v1/uploads (user-isolated) ---------------------------------
@@ -1266,6 +1298,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
+        self._audit(
+            request, "upload.create",
+            target_kind="upload", target_id=out_path,
+            payload={"size": size, "original_name": original, "extension": ext},
+        )
         return web.json_response(
             {
                 "path": out_path,
@@ -1320,6 +1357,11 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled=bool(body.get("enabled", True)),
             scope=str(body.get("scope", "global")),
         )
+        self._audit(
+            request, "mcp.upsert",
+            target_kind="mcp_server", target_id=name,
+            payload={"command": command, "args": args, "enabled": bool(body.get("enabled", True))},
+        )
         return web.json_response({"name": name, "ok": True})
 
     async def _handle_delete_mcp(self, request: "web.Request") -> "web.Response":
@@ -1335,6 +1377,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
         deleted = self._auth_store.delete_mcp_server(name)
+        self._audit(
+            request, "mcp.delete",
+            target_kind="mcp_server", target_id=name,
+            payload={"deleted": deleted},
+        )
         return web.json_response({"name": name, "deleted": deleted})
 
     # ---- /v1/users (admin-only) --------------------------------------
@@ -1393,6 +1440,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": str(exc), "type": "invalid_request_error", "code": "duplicate_handle"}},
                 status=409,
             )
+        self._audit(
+            request, "user.create",
+            target_kind="user", target_id=user.user_id,
+            payload={"handle": handle, "role": role},
+        )
         return web.json_response(self._user_to_dict(user), status=201)
 
     async def _handle_patch_user(self, request: "web.Request") -> "web.Response":
@@ -1439,6 +1491,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        changes: Dict[str, Any] = {}
         new_password = body.get("password")
         if new_password is not None:
             if not isinstance(new_password, str) or not new_password:
@@ -1447,6 +1500,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             self._auth_store.update_user_password(user_id, new_password)
+            changes["password"] = "***"
         if new_role is not None:
             if new_role not in {"user", "admin"}:
                 return web.json_response(
@@ -1454,6 +1508,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             self._auth_store.set_user_role(user_id, new_role)
+            changes["role"] = new_role
         if new_disabled is not None:
             if not isinstance(new_disabled, bool):
                 return web.json_response(
@@ -1461,7 +1516,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             self._auth_store.set_user_disabled(user_id, new_disabled)
+            changes["disabled"] = new_disabled
         updated = self._auth_store.get_user_by_id(user_id)
+        if changes:
+            self._audit(
+                request, "user.patch",
+                target_kind="user", target_id=user_id,
+                payload={"handle": target.handle, "changes": changes},
+            )
         return web.json_response(self._user_to_dict(updated))
 
     async def _handle_delete_user(self, request: "web.Request") -> "web.Response":
@@ -1481,8 +1543,45 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "cannot delete your own account", "type": "invalid_request_error"}},
                 status=400,
             )
+        target = self._auth_store.get_user_by_id(user_id)
         deleted = self._auth_store.delete_user(user_id)
+        self._audit(
+            request, "user.delete",
+            target_kind="user", target_id=user_id,
+            payload={"handle": target.handle if target else None, "deleted": deleted},
+        )
         return web.json_response({"user_id": user_id, "deleted": deleted})
+
+    # ---- /v1/audit (admin-only) --------------------------------------
+
+    async def _handle_list_audit(self, request: "web.Request") -> "web.Response":
+        _admin, err = self._require_admin(request)
+        if err is not None:
+            return err
+        if self._auth_store is None:
+            return self._auth_unavailable()
+        try:
+            limit = int(request.query.get("limit", 100))
+            offset = int(request.query.get("offset", 0))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": {"message": "limit/offset must be integers", "type": "invalid_request_error"}},
+                status=400,
+            )
+        rows = self._auth_store.list_audit(
+            limit=limit,
+            offset=offset,
+            action_prefix=request.query.get("action") or None,
+            actor_handle=request.query.get("actor") or None,
+        )
+        return web.json_response(
+            {
+                "events": rows,
+                "limit": limit,
+                "offset": offset,
+                "total": self._auth_store.count_audit(),
+            }
+        )
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
@@ -4006,6 +4105,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/users", self._handle_create_user)
             self._app.router.add_patch("/v1/users/{user_id}", self._handle_patch_user)
             self._app.router.add_delete("/v1/users/{user_id}", self._handle_delete_user)
+            # Audit log (admin-only, read-only)
+            self._app.router.add_get("/v1/audit", self._handle_list_audit)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)

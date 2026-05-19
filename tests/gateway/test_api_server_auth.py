@@ -245,6 +245,7 @@ def _build_app(tmp_path, *, api_key="test-key-xyz"):
     app.router.add_post("/v1/users", adapter._handle_create_user)
     app.router.add_patch("/v1/users/{user_id}", adapter._handle_patch_user)
     app.router.add_delete("/v1/users/{user_id}", adapter._handle_delete_user)
+    app.router.add_get("/v1/audit", adapter._handle_list_audit)
     return adapter, app
 
 
@@ -592,3 +593,100 @@ class TestUsersCrud:
         assert (
             adapter._auth_store.get_skill_overrides(alice.user_id) == {}
         )
+
+
+class TestAuditLog:
+    async def _admin_token(self, cli):
+        return (await (await _login(cli, "root", "root-pw")).json())["access_token"]
+
+    async def test_audit_admin_only(self, client):
+        _, cli = client
+        login = await _login(cli, "alice", "alice-pw")
+        token = (await login.json())["access_token"]
+        resp = await cli.get(
+            "/v1/audit", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert resp.status == 403
+
+    async def test_audit_records_user_create(self, client):
+        adapter, cli = client
+        token = await self._admin_token(cli)
+        # generate one write
+        await cli.post(
+            "/v1/users",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"handle": "dave", "password": "dave-pw"},
+        )
+        resp = await cli.get(
+            "/v1/audit?limit=5",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        body = await resp.json()
+        actions = [e["action"] for e in body["events"]]
+        assert "user.create" in actions
+        # actor recorded
+        create_event = next(e for e in body["events"] if e["action"] == "user.create")
+        assert create_event["actor_handle"] == "root"
+
+    async def test_audit_records_mcp_writes(self, client):
+        _, cli = client
+        token = await self._admin_token(cli)
+        await cli.post(
+            "/v1/mcp/servers",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"name": "_t", "command": "echo"},
+        )
+        await cli.delete(
+            "/v1/mcp/servers/_t",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        resp = await cli.get(
+            "/v1/audit?action=mcp.&limit=10",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        body = await resp.json()
+        actions = [e["action"] for e in body["events"]]
+        assert "mcp.upsert" in actions
+        assert "mcp.delete" in actions
+
+    async def test_audit_filter_by_actor(self, client):
+        _, cli = client
+        token = await self._admin_token(cli)
+        # Trigger a write so there's at least one row from root
+        await cli.post(
+            "/v1/users",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"handle": "frank", "password": "x"},
+        )
+        resp = await cli.get(
+            "/v1/audit?actor=root",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        body = await resp.json()
+        assert all(e["actor_handle"] == "root" for e in body["events"])
+
+    async def test_audit_pagination(self, client):
+        _, cli = client
+        token = await self._admin_token(cli)
+        # Produce a handful of write events to ensure offset is meaningful
+        for i in range(3):
+            await cli.post(
+                "/v1/users",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"handle": f"page_{i}", "password": "x"},
+            )
+        page1 = await (
+            await cli.get(
+                "/v1/audit?limit=2&offset=0",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        ).json()
+        page2 = await (
+            await cli.get(
+                "/v1/audit?limit=2&offset=2",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        ).json()
+        assert len(page1["events"]) == 2
+        # offset advanced — first item of page2 differs from page1's first
+        assert page1["events"][0]["id"] != page2["events"][0]["id"]

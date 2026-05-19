@@ -116,10 +116,31 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
 )
 """
 
+AUDIT_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    actor_id TEXT,
+    actor_handle TEXT,
+    action TEXT NOT NULL,
+    target_kind TEXT,
+    target_id TEXT,
+    payload_json TEXT,
+    ip TEXT
+)
+"""
+
+# Index for the common `?since=...` + reverse-chronological list pattern.
+AUDIT_LOG_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS audit_log_ts_idx ON audit_log (ts DESC)"
+)
+
 ALL_DDL: Tuple[str, ...] = (
     USERS_TABLE_DDL,
     USER_SKILL_OVERRIDES_DDL,
     MCP_SERVERS_DDL,
+    AUDIT_LOG_DDL,
+    AUDIT_LOG_INDEX_DDL,
 )
 
 
@@ -580,6 +601,90 @@ class AuthStore:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    # -- audit log --------------------------------------------------
+
+    def record_audit(
+        self,
+        *,
+        actor: Optional[Dict[str, Any]],
+        action: str,
+        target_kind: Optional[str] = None,
+        target_id: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        ip: Optional[str] = None,
+    ) -> None:
+        """Insert an audit row. Failures are swallowed (audit must never
+        break the user-facing request) but logged at WARNING.
+        """
+        try:
+            self._conn.execute(
+                "INSERT INTO audit_log "
+                "(ts, actor_id, actor_handle, action, target_kind, target_id, payload_json, ip) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    time.time(),
+                    (actor or {}).get("user_id"),
+                    (actor or {}).get("handle"),
+                    action,
+                    target_kind,
+                    target_id,
+                    json.dumps(payload, default=str) if payload is not None else None,
+                    ip,
+                ),
+            )
+            self._conn.commit()
+        except Exception as exc:
+            logger.warning("audit log insert failed: %s", exc)
+
+    def list_audit(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        action_prefix: Optional[str] = None,
+        actor_handle: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses = []
+        params: List[Any] = []
+        if action_prefix:
+            clauses.append("action LIKE ?")
+            params.append(f"{action_prefix}%")
+        if actor_handle:
+            clauses.append("actor_handle = ?")
+            params.append(actor_handle)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.extend([max(1, min(int(limit), 500)), max(0, int(offset))])
+        rows = self._conn.execute(
+            f"SELECT id, ts, actor_id, actor_handle, action, target_kind, "
+            f"target_id, payload_json, ip FROM audit_log {where} "
+            f"ORDER BY ts DESC LIMIT ? OFFSET ?",
+            params,
+        ).fetchall()
+        result = []
+        for r in rows:
+            id_, ts, actor_id, actor_handle, action, target_kind, target_id, payload_json, ip = r
+            try:
+                payload = json.loads(payload_json) if payload_json else None
+            except json.JSONDecodeError:
+                payload = None
+            result.append(
+                {
+                    "id": int(id_),
+                    "ts": float(ts),
+                    "actor_id": actor_id,
+                    "actor_handle": actor_handle,
+                    "action": action,
+                    "target_kind": target_kind,
+                    "target_id": target_id,
+                    "payload": payload,
+                    "ip": ip,
+                }
+            )
+        return result
+
+    def count_audit(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0])
 
     # -- bootstrap --------------------------------------------------
 
