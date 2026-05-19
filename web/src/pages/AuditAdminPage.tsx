@@ -7,11 +7,10 @@
  * a forensics walk doesn't need a second tool.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ChevronLeft, ChevronRight, RefreshCw } from "lucide-react";
 
 import { api, type AdminAuditEvent } from "@/lib/api";
-import { usePageHeader } from "@/contexts/usePageHeader";
 
 const PAGE_SIZE = 50;
 
@@ -36,16 +35,6 @@ export default function AuditAdminPage() {
   const [actorFilter, setActorFilter] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
-  usePageHeader(
-    useMemo(
-      () => ({
-        title: "Audit log",
-        subtitle: "Every admin write captured for forensics",
-      }),
-      [],
-    ),
-  );
 
   const refresh = useCallback(
     async (nextOffset = offset) => {

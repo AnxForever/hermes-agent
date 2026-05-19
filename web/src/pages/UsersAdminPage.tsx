@@ -8,11 +8,10 @@
  *   - can't disable, demote, or delete the currently-logged-in admin
  */
 
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { Plus, Trash2, X } from "lucide-react";
 
 import { api, type AdminUser } from "@/lib/api";
-import { usePageHeader } from "@/contexts/usePageHeader";
 
 function formatTs(ts: number | null): string {
   if (!ts) return "—";
@@ -35,13 +34,6 @@ export default function UsersAdminPage() {
   const [creating, setCreating] = useState(false);
   const [createForm, setCreateForm] = useState<CreateFormState>(EMPTY_FORM);
   const [busyUser, setBusyUser] = useState<string | null>(null);
-
-  usePageHeader(
-    useMemo(
-      () => ({ title: "Users", subtitle: "Local accounts that can sign in" }),
-      [],
-    ),
-  );
 
   const refresh = useCallback(async () => {
     setLoading(true);

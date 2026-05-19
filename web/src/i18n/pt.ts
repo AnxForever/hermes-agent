@@ -654,6 +654,7 @@ export const pt: Translations = {
     columnLabels: {
       triage: "Triagem",
       todo: "A fazer",
+      scheduled: "Agendado",
       ready: "Pronto",
       running: "Em curso",
       blocked: "Bloqueado",
@@ -663,6 +664,7 @@ export const pt: Translations = {
     columnHelp: {
       triage: "Ideias em bruto — um specifier vai detalhar a especificação",
       todo: "À espera de dependências ou sem atribuição",
+      scheduled: "Aguardando um atraso conhecido ou acompanhamento agendado",
       ready: "Dependências satisfeitas; atribua um perfil para despachar",
       running: "Reivindicado por um worker — em execução",
       blocked: "O worker pediu intervenção humana",
