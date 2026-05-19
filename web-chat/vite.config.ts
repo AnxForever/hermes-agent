@@ -13,6 +13,18 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // Resolve the shared design-tokens package without requiring an
+      // npm workspace install. Works both in monorepo (workspace symlink
+      // is identical) and in environments that build without `npm install`
+      // at the repo root.
+      "@hermes/design-tokens/tokens.css": path.resolve(
+        __dirname,
+        "../packages/design-tokens/src/tokens.css",
+      ),
+      "@hermes/design-tokens": path.resolve(
+        __dirname,
+        "../packages/design-tokens/src",
+      ),
     },
   },
   server: {
