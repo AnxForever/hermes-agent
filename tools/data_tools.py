@@ -52,7 +52,16 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-_ALLOWED_ROOT = Path("/opt/data").resolve()
+_ALLOWED_ROOTS: tuple = (
+    Path("/opt/data").resolve(),
+    Path("/opt/uploads").resolve(),
+)
+# Backwards-compat alias — many call sites still reference _ALLOWED_ROOT
+# as the canonical "where do data files live" anchor (e.g. error hints,
+# charts-dir derivation). Keep it pointing at /opt/data so chart output
+# and "recent files" hints don't suddenly move; the second root only
+# widens the *input* whitelist.
+_ALLOWED_ROOT = _ALLOWED_ROOTS[0]
 _MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB hard ceiling
 _DEFAULT_ROW_LIMIT = 10_000  # describe truncates to this many rows
 _CHARTS_DIR = _ALLOWED_ROOT / "cache" / "charts"
@@ -108,13 +117,23 @@ def _validate_path(path: str) -> Tuple[bool, str, str, Optional[Path]]:
         resolved = Path(path).expanduser().resolve()
     except (OSError, RuntimeError) as exc:
         return False, f"could not resolve path: {exc}", "", None
-    try:
-        resolved.relative_to(_ALLOWED_ROOT)
-    except ValueError:
+    inside_allowed = False
+    for root in _ALLOWED_ROOTS:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        inside_allowed = True
+        break
+    if not inside_allowed:
+        roots_str = " or ".join(str(r) for r in _ALLOWED_ROOTS)
         return (
             False,
-            f"path must be inside {_ALLOWED_ROOT}",
-            "Feishu attachments land under /opt/data/cache/. Use that prefix.",
+            f"path must be inside {roots_str}",
+            (
+                "Feishu attachments land under /opt/data/cache/; user uploads land "
+                "under /opt/uploads/<user_id>/. Use one of those prefixes."
+            ),
             None,
         )
     if not resolved.exists():

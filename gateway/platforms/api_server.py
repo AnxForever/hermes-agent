@@ -45,6 +45,14 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.api_auth import (
+    AuthStore,
+    JWT_TTL_SECONDS,
+    UserRecord,
+    check_bearer,
+    encode_jwt,
+    verify_password,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -339,8 +347,10 @@ class ResponseStore:
                 db_path = ":memory:"
         try:
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
+            self._db_path = db_path
         except Exception:
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._db_path = ":memory:"
         # Use shared WAL-fallback helper so response_store.db degrades
         # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME (same filesystem
         # issue addressed for state.db/kanban.db — see
@@ -648,6 +658,26 @@ class APIServerAdapter(BasePlatformAdapter):
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
+        # Always include localhost dev origins for the dashboard (9119) and
+        # the new user web-chat dev (5173) / nginx-fronted prod (9120). They
+        # are loopback-only so widening here doesn't change the threat model
+        # — a remote attacker still can't reach them. Operators who want a
+        # stricter policy set API_SERVER_CORS_ORIGINS explicitly *and* set
+        # API_SERVER_CORS_NO_DEFAULTS=1.
+        if not os.getenv("API_SERVER_CORS_NO_DEFAULTS"):
+            _dev_defaults = (
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+                "http://localhost:9119",
+                "http://127.0.0.1:9119",
+                "http://localhost:9120",
+                "http://127.0.0.1:9120",
+            )
+            existing = set(self._cors_origins)
+            self._cors_origins = tuple(
+                list(self._cors_origins)
+                + [o for o in _dev_defaults if o not in existing]
+            )
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
@@ -655,6 +685,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        self._auth_store: Optional[AuthStore] = None  # Lazy-init in start()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -741,20 +772,38 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
-        Validate Bearer token from Authorization header.
+        Validate the ``Authorization: Bearer <token>`` header.
 
-        Returns None if auth is OK, or a 401 web.Response on failure.
-        If no API key is configured, all requests are allowed (only when API
-        server is local).
+        Dual-path resolution (see ``gateway.platforms.api_auth.check_bearer``):
+          1. Try the token as a JWT signed with ``API_SERVER_KEY``. On
+             success, attach the decoded user dict to ``request['user']``.
+          2. Fall back to a constant-time compare against the raw
+             ``API_SERVER_KEY``. On success, attach a synthetic admin user
+             (``handle='_legacy_key_'``) so downstream handlers always see
+             a user record.
+
+        Returns ``None`` if auth is OK, or a 401 ``web.Response`` on
+        failure. If no API key is configured, all requests are allowed
+        (local-only mode) and ``request['user']`` is set to a synthetic
+        ``handle='_anonymous_'`` admin so handlers don't have to guard.
         """
         if not self._api_key:
+            request["user"] = {
+                "user_id": "_anonymous_",
+                "handle": "_anonymous_",
+                "role": "admin",
+                "auth_source": "no_api_key",
+            }
             return None  # No key configured — allow all (local-only use)
 
         auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-            if hmac.compare_digest(token, self._api_key):
-                return None  # Auth OK
+        user, _reason = check_bearer(
+            authorization_header=auth_header,
+            api_key=self._api_key,
+        )
+        if user is not None:
+            request["user"] = user
+            return None
 
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
@@ -914,6 +963,379 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
+
+    def _auth_unavailable(self) -> "web.Response":
+        return web.json_response(
+            {
+                "error": {
+                    "message": (
+                        "Auth subsystem unavailable. Confirm API_SERVER_KEY "
+                        "is set and the response_store.db is writable."
+                    ),
+                    "type": "service_unavailable",
+                    "code": "auth_unavailable",
+                }
+            },
+            status=503,
+        )
+
+    async def _handle_auth_login(self, request: "web.Request") -> "web.Response":
+        """POST /v1/auth/login — exchange handle+password for a JWT."""
+        if self._auth_store is None or not self._api_key:
+            return self._auth_unavailable()
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return web.json_response(
+                {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}},
+                status=400,
+            )
+        handle = str(payload.get("handle") or "").strip()
+        password = payload.get("password") or ""
+        if not handle or not password:
+            return web.json_response(
+                {"error": {"message": "handle and password required", "type": "invalid_request_error"}},
+                status=400,
+            )
+        user = self._auth_store.get_user_by_handle(handle)
+        if user is None or user.disabled or not verify_password(password, user.password_hash):
+            # Same 401 for missing/disabled/wrong-password to avoid enumeration.
+            return web.json_response(
+                {"error": {"message": "invalid credentials", "type": "invalid_request_error", "code": "invalid_credentials"}},
+                status=401,
+            )
+        token, expires_at = encode_jwt(
+            user_id=user.user_id,
+            handle=user.handle,
+            role=user.role,
+            signing_key=self._api_key,
+        )
+        try:
+            self._auth_store.touch_last_seen(user.user_id)
+        except Exception:
+            logger.debug("touch_last_seen failed for %s", user.user_id, exc_info=True)
+        return web.json_response(
+            {
+                "access_token": token,
+                "token_type": "Bearer",
+                "expires_in": JWT_TTL_SECONDS,
+                "expires_at": expires_at,
+                "user": {
+                    "user_id": user.user_id,
+                    "handle": user.handle,
+                    "role": user.role,
+                },
+            }
+        )
+
+    async def _handle_auth_me(self, request: "web.Request") -> "web.Response":
+        """GET /v1/auth/me — return the currently authenticated user."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        user = request.get("user") or {}
+        return web.json_response(
+            {
+                "user_id": user.get("user_id"),
+                "handle": user.get("handle"),
+                "role": user.get("role"),
+                "auth_source": user.get("auth_source"),
+            }
+        )
+
+    async def _handle_auth_logout(self, request: "web.Request") -> "web.Response":
+        """POST /v1/auth/logout — client-side token discard.
+
+        We don't maintain a blocklist; tokens expire on their own (12h).
+        Returning 202 makes the contract explicit: the server acknowledged
+        the request but didn't change persistent state.
+        """
+        return web.json_response({"status": "accepted"}, status=202)
+
+    # ---- /v1/skills (user-scoped) ------------------------------------
+
+    def _require_user(
+        self, request: "web.Request"
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        err = self._check_auth(request)
+        if err is not None:
+            return None, err
+        user = request.get("user") or {}
+        if not user.get("user_id"):
+            return None, web.json_response(
+                {"error": {"message": "user not resolved", "type": "auth_error"}},
+                status=401,
+            )
+        return user, None
+
+    def _require_admin(
+        self, request: "web.Request"
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        user, err = self._require_user(request)
+        if err is not None:
+            return None, err
+        if (user or {}).get("role") != "admin":
+            return None, web.json_response(
+                {"error": {"message": "admin role required", "type": "forbidden"}},
+                status=403,
+            )
+        return user, None
+
+    async def _handle_list_skills(self, request: "web.Request") -> "web.Response":
+        """GET /v1/skills — list skills with per-user enabled state.
+
+        The shape mirrors dashboard ``/api/skills``: each entry carries
+        ``name``, ``description``, ``enabled``. ``enabled`` reflects the
+        merged view (per-user override wins over the global default).
+        """
+        user, err = self._require_user(request)
+        if err is not None:
+            return err
+        if self._auth_store is None:
+            return self._auth_unavailable()
+        try:
+            from tools.skills_tool import _find_all_skills  # type: ignore
+        except Exception as exc:
+            logger.exception("skill scanner import failed")
+            return web.json_response(
+                {"error": {"message": f"skill scanner unavailable: {exc}", "type": "internal_error"}},
+                status=500,
+            )
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.skills_config import get_disabled_skills
+            global_disabled = set(get_disabled_skills(load_config()))
+        except Exception:
+            global_disabled = set()
+        try:
+            skills = _find_all_skills(skip_disabled=True) or []
+        except Exception as exc:
+            logger.exception("skill scan failed")
+            return web.json_response(
+                {"error": {"message": f"skill scan failed: {exc}", "type": "internal_error"}},
+                status=500,
+            )
+        overrides = self._auth_store.get_skill_overrides(user["user_id"])
+        result = []
+        for entry in skills:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not name:
+                continue
+            global_enabled = name not in global_disabled
+            user_enabled = overrides.get(name, global_enabled)
+            item = dict(entry)
+            item["enabled"] = bool(user_enabled)
+            item["global_default"] = bool(global_enabled)
+            item["override"] = name in overrides
+            result.append(item)
+        return web.json_response({"skills": result})
+
+    async def _handle_toggle_skill(self, request: "web.Request") -> "web.Response":
+        """POST /v1/skills/{name}/toggle — set user's override for a skill."""
+        user, err = self._require_user(request)
+        if err is not None:
+            return err
+        if self._auth_store is None:
+            return self._auth_unavailable()
+        name = request.match_info.get("name", "").strip()
+        if not name:
+            return web.json_response(
+                {"error": {"message": "skill name required", "type": "invalid_request_error"}},
+                status=400,
+            )
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return web.json_response(
+                {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}},
+                status=400,
+            )
+        if "enabled" not in body or not isinstance(body["enabled"], bool):
+            return web.json_response(
+                {"error": {"message": "body must include enabled: bool", "type": "invalid_request_error"}},
+                status=400,
+            )
+        self._auth_store.set_skill_override(
+            user_id=user["user_id"],
+            skill_name=name,
+            enabled=bool(body["enabled"]),
+        )
+        return web.json_response({"name": name, "enabled": bool(body["enabled"])})
+
+    # ---- /v1/uploads (user-isolated) ---------------------------------
+
+    _UPLOAD_ROOT = "/opt/uploads"
+    _UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+    _UPLOAD_ALLOWED_EXTS = frozenset({
+        ".xlsx", ".xls", ".csv", ".tsv", ".json", ".jsonl", ".parquet",
+        ".pdf", ".docx", ".txt", ".md",
+    })
+
+    async def _handle_upload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/uploads — multipart upload to ``/opt/uploads/<user_id>/``."""
+        user, err = self._require_user(request)
+        if err is not None:
+            return err
+        try:
+            reader = await request.multipart()
+        except Exception as exc:
+            return web.json_response(
+                {"error": {"message": f"multipart parse failed: {exc}", "type": "invalid_request_error"}},
+                status=400,
+            )
+        field = None
+        while True:
+            try:
+                part = await reader.next()
+            except Exception:
+                part = None
+            if part is None:
+                break
+            if part.name == "file":
+                field = part
+                break
+        if field is None:
+            return web.json_response(
+                {"error": {"message": "form field 'file' missing", "type": "invalid_request_error"}},
+                status=400,
+            )
+        original = (field.filename or "upload.bin").strip()
+        ext = os.path.splitext(original)[1].lower()
+        if ext not in self._UPLOAD_ALLOWED_EXTS:
+            return web.json_response(
+                {"error": {
+                    "message": f"extension {ext!r} not allowed; permitted: {sorted(self._UPLOAD_ALLOWED_EXTS)}",
+                    "type": "invalid_request_error",
+                    "code": "unsupported_upload_extension",
+                }},
+                status=400,
+            )
+
+        # Confine to /opt/uploads/<user_id>/ — user_id is opaque hex from
+        # AuthStore so we trust it as a safe path component, but still
+        # resolve()+startswith()-guard the result for defence in depth.
+        user_dir = os.path.join(self._UPLOAD_ROOT, str(user["user_id"]))
+        try:
+            os.makedirs(user_dir, mode=0o755, exist_ok=True)
+        except OSError as exc:
+            logger.exception("upload mkdir failed")
+            return web.json_response(
+                {"error": {"message": f"upload directory unavailable: {exc}", "type": "internal_error"}},
+                status=500,
+            )
+        out_name = f"{uuid.uuid4().hex}{ext}"
+        out_path = os.path.join(user_dir, out_name)
+        resolved = os.path.realpath(out_path)
+        if not resolved.startswith(os.path.realpath(self._UPLOAD_ROOT) + os.sep):
+            return web.json_response(
+                {"error": {"message": "upload path escape detected", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        size = 0
+        try:
+            with open(out_path, "wb") as fh:
+                while True:
+                    chunk = await field.read_chunk(64 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > self._UPLOAD_MAX_BYTES:
+                        fh.close()
+                        try:
+                            os.unlink(out_path)
+                        except OSError:
+                            pass
+                        return web.json_response(
+                            {"error": {
+                                "message": f"upload exceeds {self._UPLOAD_MAX_BYTES} byte cap",
+                                "type": "invalid_request_error",
+                                "code": "upload_too_large",
+                            }},
+                            status=413,
+                        )
+                    fh.write(chunk)
+        except Exception as exc:
+            logger.exception("upload write failed")
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            return web.json_response(
+                {"error": {"message": f"upload write failed: {exc}", "type": "internal_error"}},
+                status=500,
+            )
+
+        return web.json_response(
+            {
+                "path": out_path,
+                "size": size,
+                "original_name": original,
+                "extension": ext,
+            }
+        )
+
+    # ---- /v1/mcp/servers (admin-only) --------------------------------
+
+    async def _handle_list_mcp(self, request: "web.Request") -> "web.Response":
+        _admin, err = self._require_admin(request)
+        if err is not None:
+            return err
+        if self._auth_store is None:
+            return self._auth_unavailable()
+        return web.json_response({"servers": self._auth_store.list_mcp_servers()})
+
+    async def _handle_upsert_mcp(self, request: "web.Request") -> "web.Response":
+        _admin, err = self._require_admin(request)
+        if err is not None:
+            return err
+        if self._auth_store is None:
+            return self._auth_unavailable()
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return web.json_response(
+                {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}},
+                status=400,
+            )
+        name = str(body.get("name") or "").strip()
+        command = str(body.get("command") or "").strip()
+        if not name or not command:
+            return web.json_response(
+                {"error": {"message": "name and command required", "type": "invalid_request_error"}},
+                status=400,
+            )
+        args = body.get("args") or []
+        env = body.get("env") or {}
+        if not isinstance(args, list) or not isinstance(env, dict):
+            return web.json_response(
+                {"error": {"message": "args must be list, env must be dict", "type": "invalid_request_error"}},
+                status=400,
+            )
+        self._auth_store.upsert_mcp_server(
+            name=name,
+            command=command,
+            args=[str(a) for a in args],
+            env={str(k): str(v) for k, v in env.items()},
+            enabled=bool(body.get("enabled", True)),
+            scope=str(body.get("scope", "global")),
+        )
+        return web.json_response({"name": name, "ok": True})
+
+    async def _handle_delete_mcp(self, request: "web.Request") -> "web.Response":
+        _admin, err = self._require_admin(request)
+        if err is not None:
+            return err
+        if self._auth_store is None:
+            return self._auth_unavailable()
+        name = request.match_info.get("name", "").strip()
+        if not name:
+            return web.json_response(
+                {"error": {"message": "server name required", "type": "invalid_request_error"}},
+                status=400,
+            )
+        deleted = self._auth_store.delete_mcp_server(name)
+        return web.json_response({"name": name, "deleted": deleted})
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
@@ -3393,6 +3815,19 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("[%s] aiohttp not installed", self.name)
             return False
 
+        # Initialize the auth store (users table + bootstrap admin). It
+        # shares the response-store SQLite file so /v1/auth/* and
+        # /v1/skills don't grow a second database for the gateway image
+        # to ship. Failure is non-fatal: legacy API_SERVER_KEY still works
+        # without it, and clients that try to /v1/auth/login will get a
+        # clear 503 from the handlers below.
+        try:
+            self._auth_store = AuthStore(self._response_store._db_path)
+            self._auth_store.ensure_bootstrap_admin()
+        except Exception:
+            logger.exception("[%s] AuthStore init failed — /v1/auth/* will 503", self.name)
+            self._auth_store = None
+
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
@@ -3406,6 +3841,19 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            # Auth routes (unauthenticated /login, authenticated /me, /logout)
+            self._app.router.add_post("/v1/auth/login", self._handle_auth_login)
+            self._app.router.add_get("/v1/auth/me", self._handle_auth_me)
+            self._app.router.add_post("/v1/auth/logout", self._handle_auth_logout)
+            # User-scoped skills (per-user overrides on top of global default)
+            self._app.router.add_get("/v1/skills", self._handle_list_skills)
+            self._app.router.add_post("/v1/skills/{name}/toggle", self._handle_toggle_skill)
+            # User-scoped file uploads (multipart, lands under /opt/uploads/<user_id>/)
+            self._app.router.add_post("/v1/uploads", self._handle_upload)
+            # MCP server registry (admin-only)
+            self._app.router.add_get("/v1/mcp/servers", self._handle_list_mcp)
+            self._app.router.add_post("/v1/mcp/servers", self._handle_upsert_mcp)
+            self._app.router.add_delete("/v1/mcp/servers/{name}", self._handle_delete_mcp)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
