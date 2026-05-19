@@ -31,6 +31,9 @@ services:
       - "8642"
     volumes:
       - ~/.hermes:/opt/data
+      # User-scoped uploads from /v1/uploads land here. Separate named
+      # volume so backups/exports can target it independently.
+      - hermes-uploads:/opt/uploads
       # Mount the team-config repo at the *same host path* so SOUL.md
       # (which is a host symlink to ~/hermes-team-config/SOUL.md) resolves
       # both inside and outside the container.
@@ -79,3 +82,38 @@ services:
     # Bind 0.0.0.0 inside the container so Docker port mapping can forward
     # --host 0.0.0.0. Port mapped to 127.0.0.1:9119 on host for security.
     command: ["dashboard", "--host", "0.0.0.0", "--no-open", "--insecure"]
+
+  # User-facing chat SPA served by nginx. The nginx container also acts as
+  # a reverse proxy for /v1/* so the SPA can talk to the gateway without
+  # exposing port 8642 to the host. SSE responses bypass buffering — see
+  # docker/nginx/web-chat.conf.
+  web-chat:
+    image: nginx:1.27-alpine
+    container_name: hermes-web-chat
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    ports:
+      - "127.0.0.1:9120:80"
+    volumes:
+      # Static SPA bundle, built into the hermes-agent image at
+      # /opt/hermes/web-chat/dist by the Dockerfile.
+      - web-chat-dist:/usr/share/nginx/html:ro
+      - ./docker/nginx/web-chat.conf:/etc/nginx/conf.d/default.conf:ro
+
+  # One-shot init container that copies the freshly-built web-chat bundle
+  # from the hermes-agent image into the shared volume so nginx can serve
+  # it. Runs each compose-up; exits when the copy succeeds.
+  web-chat-build-copy:
+    image: hermes-agent
+    container_name: hermes-web-chat-build-copy
+    depends_on:
+      - gateway
+    volumes:
+      - web-chat-dist:/dist
+    entrypoint: ["sh", "-c", "cp -r /opt/hermes/web-chat/dist/* /dist/ && echo 'web-chat bundle staged'"]
+    restart: "no"
+
+volumes:
+  hermes-uploads: {}
+  web-chat-dist: {}

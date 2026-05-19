@@ -36,6 +36,8 @@ WORKDIR /opt/hermes
 # workspace to real content instead of stopping at a bare package.json.
 COPY package.json package-lock.json ./
 COPY web/package.json web/package-lock.json web/
+COPY web-chat/package.json web-chat/
+COPY packages/ packages/
 COPY ui-tui/package.json ui-tui/package-lock.json ui-tui/
 COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
 
@@ -53,6 +55,7 @@ ENV npm_config_install_links=false
 RUN npm install --prefer-offline --no-audit && \
     npx playwright install --with-deps chromium --only-shell && \
     (cd web && npm install --prefer-offline --no-audit) && \
+    (cd web-chat && npm install --prefer-offline --no-audit) && \
     (cd ui-tui && npm install --prefer-offline --no-audit) && \
     npm cache clean --force
 
@@ -85,8 +88,11 @@ RUN uv sync --frozen --no-install-project --extra all --extra messaging
 # .dockerignore excludes node_modules, so the installs above survive.
 COPY --chown=hermes:hermes . .
 
-# Build browser dashboard and terminal UI assets.
+# Build browser dashboard, user-facing web-chat, and terminal UI assets.
+# web-chat output lands at /opt/hermes/web-chat/dist — nginx mounts this
+# directory in docker-compose.yml.
 RUN cd web && npm run build && \
+    cd ../web-chat && npm run build && \
     cd ../ui-tui && npm run build
 
 # ---------- Permissions ----------
