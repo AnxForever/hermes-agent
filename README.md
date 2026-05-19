@@ -28,6 +28,20 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 ---
 
+## Web Demo (browser-based chat)
+
+A user-facing web chat ships alongside the admin dashboard. After a
+`docker compose up -d --build`, open `http://127.0.0.1:9120` and sign
+in as `admin` / `darling` (default — override via
+`HERMES_BOOTSTRAP_ADMIN_PASSWORD`). The user app streams chat
+responses, supports file uploads, and exposes per-user skill toggles
+without unlocking any of the admin dashboard's operational surface.
+
+Full walkthrough — architecture, auth model, smoke tests, and
+troubleshooting — lives in **[docs/WEB_DEMO.md](docs/WEB_DEMO.md)**.
+
+---
+
 ## Quick Install
 
 ### Linux, macOS, WSL2, Termux

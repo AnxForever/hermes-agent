@@ -28,6 +28,14 @@
 
 ---
 
+## Web Demo（浏览器聊天界面）
+
+除了原有的 admin dashboard，仓库现在自带一个面向终端用户的 Web 聊天前端。`docker compose up -d --build` 起来后，浏览器打开 `http://127.0.0.1:9120`，用 `admin` / `darling`（默认密码，可通过 `HERMES_BOOTSTRAP_ADMIN_PASSWORD` 覆盖）登录即可。Web 端支持流式聊天、文件上传、按用户开关 skill，但 **不暴露任何后台运维入口**。
+
+完整文档（架构图、鉴权模型、smoke 测试、故障排查）见 **[docs/WEB_DEMO.md](docs/WEB_DEMO.md)**。
+
+---
+
 ## 快速安装
 
 ```bash
