@@ -558,52 +558,143 @@ def _build_markdown_post_payload(content: str) -> str:
     )
 
 
+_TABLE_SEPARATOR_LINE_RE = re.compile(r"^\|[-|: ]+\|$")
+
+
+def _split_table_row(line: str) -> List[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _convert_table_to_markdown_list(table_lines: List[str]) -> str:
+    """Convert a markdown table block into a markdown bullet list.
+
+    Feishu's `md` post tag cannot render tables, but bullet lists render
+    cleanly. Keep the first cell as the row label and join the rest as
+    bold-key · value pairs so headers remain meaningful.
+    """
+    if len(table_lines) < 2:
+        return "\n".join(table_lines)
+    headers = _split_table_row(table_lines[0])
+    data_rows = [_split_table_row(line) for line in table_lines[2:]]
+    if not data_rows:
+        return "\n".join(table_lines)
+
+    output: List[str] = []
+    for row in data_rows:
+        if not row:
+            continue
+        if len(headers) <= 2 or len(row) <= 2:
+            label = row[0] if row else ""
+            value = row[1] if len(row) > 1 else ""
+            line = f"- **{label}**：{value}" if label else f"- {value}"
+            output.append(line.rstrip(" ："))
+            continue
+        label = row[0]
+        pairs = []
+        for h, v in zip(headers[1:], row[1:]):
+            if not v:
+                continue
+            pairs.append(f"**{h}**：{v}" if h else v)
+        joined = " · ".join(pairs)
+        output.append(f"- **{label}**：{joined}" if label else f"- {joined}")
+    return "\n".join(output)
+
+
 def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
-    """Build Feishu post rows while isolating fenced code blocks.
+    """Build Feishu post rows while isolating fenced code blocks and tables.
 
     Feishu's `md` renderer can swallow trailing content when a fenced code block
-    appears inside one large markdown element. Split the reply at real fence
-    lines so prose before/after the code block remains visible while code stays
-    in a dedicated row.
+    appears inside one large markdown element, and it does not render markdown
+    tables at all. Split the reply at fence lines so prose before/after the
+    code block remains visible, and emit table blocks as plain-text rows while
+    keeping surrounding prose as markdown so bold/headers/lists still render.
     """
     if not content:
         return [[{"tag": "md", "text": ""}]]
-    if "```" not in content:
-        return [[{"tag": "md", "text": content}]]
 
     rows: List[List[Dict[str, str]]] = []
-    current: List[str] = []
+    current_md: List[str] = []
+    current_table: List[str] = []
     in_code_block = False
+    in_table = False
 
-    def _flush_current() -> None:
-        nonlocal current
-        if not current:
+    def _flush_md() -> None:
+        nonlocal current_md
+        if not current_md:
             return
-        segment = "\n".join(current)
+        segment = "\n".join(current_md)
         if segment.strip():
             rows.append([{"tag": "md", "text": segment}])
-        current = []
+        current_md = []
 
-    for raw_line in content.splitlines():
+    def _flush_table() -> None:
+        nonlocal current_table
+        if not current_table:
+            return
+        converted = _convert_table_to_markdown_list(current_table)
+        if converted.strip():
+            rows.append([{"tag": "md", "text": converted}])
+        current_table = []
+
+    lines = content.splitlines()
+    i = 0
+    while i < len(lines):
+        raw_line = lines[i]
         stripped_line = raw_line.strip()
-        is_fence = bool(
-            _MARKDOWN_FENCE_CLOSE_RE.match(stripped_line)
-            if in_code_block
-            else _MARKDOWN_FENCE_OPEN_RE.match(stripped_line)
-        )
 
-        if is_fence:
-            if not in_code_block:
-                _flush_current()
-            current.append(raw_line)
-            in_code_block = not in_code_block
-            if not in_code_block:
-                _flush_current()
+        if not in_table:
+            is_fence = bool(
+                _MARKDOWN_FENCE_CLOSE_RE.match(stripped_line)
+                if in_code_block
+                else _MARKDOWN_FENCE_OPEN_RE.match(stripped_line)
+            )
+            if is_fence:
+                if not in_code_block:
+                    _flush_md()
+                current_md.append(raw_line)
+                in_code_block = not in_code_block
+                if not in_code_block:
+                    _flush_md()
+                i += 1
+                continue
+            if in_code_block:
+                current_md.append(raw_line)
+                i += 1
+                continue
+
+            # Detect table start: pipe row followed by separator row.
+            if (
+                stripped_line.startswith("|")
+                and stripped_line.endswith("|")
+                and i + 1 < len(lines)
+                and _TABLE_SEPARATOR_LINE_RE.match(lines[i + 1].strip())
+            ):
+                _flush_md()
+                in_table = True
+                current_table.append(raw_line)
+                i += 1
+                continue
+
+            current_md.append(raw_line)
+            i += 1
             continue
 
-        current.append(raw_line)
+        # Inside a table block.
+        if stripped_line.startswith("|") and stripped_line.endswith("|"):
+            current_table.append(raw_line)
+            i += 1
+            continue
+        _flush_table()
+        in_table = False
+        # Re-process this line as non-table content on next iteration.
 
-    _flush_current()
+    _flush_md()
+    _flush_table()
     return rows or [[{"tag": "md", "text": content}]]
 
 
@@ -4222,13 +4313,11 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Feishu post-type 'md' elements do not render markdown tables; sending
-        # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
-        if _MARKDOWN_TABLE_RE.search(content):
-            text_payload = {"text": content}
-            return "text", json.dumps(text_payload, ensure_ascii=False)
-        if _MARKDOWN_HINT_RE.search(content):
+        # Feishu post-type 'md' elements do not render markdown tables; the post
+        # row builder isolates tables into plain-text rows so surrounding prose
+        # still renders as markdown. Route through post whenever markdown hints
+        # or tables exist, and fall back to plain text only for pure prose.
+        if _MARKDOWN_HINT_RE.search(content) or _MARKDOWN_TABLE_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
