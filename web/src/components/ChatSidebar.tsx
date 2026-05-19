@@ -35,6 +35,7 @@ import { HERMES_BASE_PATH } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { AlertCircle, ChevronDown, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useI18n } from "@/i18n";
 
 interface SessionInfo {
   cwd?: string;
@@ -50,13 +51,15 @@ interface RpcEnvelope {
 
 const TOOL_LIMIT = 20;
 
-const STATE_LABEL: Record<ConnectionState, string> = {
-  idle: "idle",
-  connecting: "connecting",
-  open: "live",
-  closed: "closed",
-  error: "error",
-};
+function useStateLabel(t: ReturnType<typeof useI18n>["t"]): Record<ConnectionState, string> {
+  return {
+    idle: t.common.unknown,
+    connecting: t.status.starting,
+    open: t.common.live,
+    closed: t.status.stopped,
+    error: t.status.error,
+  };
+}
 
 const STATE_TONE: Record<
   ConnectionState,
@@ -75,6 +78,8 @@ interface ChatSidebarProps {
 }
 
 export function ChatSidebar({ channel, className }: ChatSidebarProps) {
+  const { t } = useI18n();
+  const STATE_LABEL = useStateLabel(t);
   // `version` bumps on reconnect; gw is derived so we never call setState
   // for it inside an effect (React 19's set-state-in-effect rule). The
   // counter is the dependency on purpose — it's not read in the memo body,
@@ -311,7 +316,7 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
       <Card className="flex items-center justify-between gap-2 px-3 py-2">
         <div className="min-w-0">
           <div className="text-xs uppercase tracking-wider text-muted-foreground">
-            model
+            {t.app.nav.models}
           </div>
 
           <Button
@@ -358,7 +363,7 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
 
       <Card className="flex min-h-0 flex-none flex-col px-2 py-2">
         <div className="px-1 pb-2 text-xs uppercase tracking-wider text-muted-foreground">
-          tools
+          {t.common.tools}
         </div>
 
         <div className="flex min-h-0 flex-col gap-1.5">

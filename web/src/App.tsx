@@ -31,6 +31,8 @@ import {
   Menu,
   MessageSquare,
   Package,
+  PanelLeftClose,
+  PanelLeftOpen,
   Puzzle,
   RotateCw,
   Settings,
@@ -312,6 +314,14 @@ export default function App() {
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
+
+  // Desktop sidebar collapse — icon-only rail that expands on hover, locks on click.
+  // `collapsed` controls the layout width (icons-only vs full). `hoverExpanded`
+  // floats the full sidebar on top of main content without shifting it.
+  const [collapsed, setCollapsed] = useState(true);
+  const [hoverExpanded, setHoverExpanded] = useState(false);
+  const isVisuallyCollapsed = collapsed && !hoverExpanded;
+  const isFloating = collapsed && hoverExpanded;
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
@@ -471,16 +481,31 @@ export default function App() {
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden pt-14 lg:pt-0">
         <div className="flex min-h-0 min-w-0 flex-1">
+          {/* Layout placeholder — reserves the collapsed/expanded width in the flex row
+              so main content never shifts. The actual sidebar (next sibling) is positioned
+              over this placeholder. Mobile drawer is handled in the aside itself. */}
+          <div
+            aria-hidden
+            className={cn(
+              "hidden lg:block shrink-0 transition-all duration-200 ease-out",
+              collapsed ? "w-14" : "w-64",
+            )}
+          />
+
           <aside
             id="app-sidebar"
             aria-label={t.app.navigation}
+            onMouseEnter={() => collapsed && setHoverExpanded(true)}
+            onMouseLeave={() => setHoverExpanded(false)}
             className={cn(
-              "fixed top-0 left-0 z-50 flex h-dvh max-h-dvh w-64 min-h-0 flex-col",
+              "fixed top-0 left-0 z-50 flex h-dvh max-h-dvh min-h-0 flex-col",
               "border-r border-current/20",
               "bg-background-base/95 backdrop-blur-sm",
-              "transition-transform duration-200 ease-out",
+              "transition-all duration-200 ease-out",
+              isVisuallyCollapsed ? "w-14" : "w-64",
               mobileOpen ? "translate-x-0" : "-translate-x-full",
-              "lg:sticky lg:top-0 lg:translate-x-0 lg:shrink-0",
+              "lg:translate-x-0",
+              isFloating && "lg:shadow-2xl",
             )}
             style={{
               background: "var(--component-sidebar-background)",
@@ -490,12 +515,13 @@ export default function App() {
           >
             <div
               className={cn(
-                "flex h-14 shrink-0 items-center justify-between gap-2 px-4",
-                "border-b border-current/20",
+                "flex h-14 shrink-0 items-center gap-2 border-b border-current/20",
+                isVisuallyCollapsed ? "justify-center px-1" : "justify-between px-4",
               )}
             >
-              <div className="flex items-center gap-2">
-                <PluginSlot name="header-left" />
+              {!isVisuallyCollapsed && (
+                <div className="flex items-center gap-2">
+                  <PluginSlot name="header-left" />
 
                 <Typography
                   className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground"
@@ -505,7 +531,19 @@ export default function App() {
                   <br />
                   Agent
                 </Typography>
-              </div>
+                </div>
+              )}
+
+              <Button
+                ghost
+                size="icon"
+                onClick={() => setCollapsed((v) => !v)}
+                aria-label={isVisuallyCollapsed ? t.common.expand : t.common.collapse}
+                title={isVisuallyCollapsed ? t.common.expand : t.common.collapse}
+                className="hidden lg:flex text-midground/50 hover:text-midground"
+              >
+                {isVisuallyCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
+              </Button>
 
               <Button
                 ghost
@@ -526,6 +564,7 @@ export default function App() {
                 {sidebarNav.coreItems.map((item) => (
                   <SidebarNavLink
                     closeMobile={closeMobile}
+                    collapsed={isVisuallyCollapsed}
                     item={item}
                     key={item.path}
                     t={t}
@@ -535,24 +574,30 @@ export default function App() {
 
               {sidebarNav.pluginItems.length > 0 && (
                 <div
-                  aria-labelledby="hermes-sidebar-plugin-nav-heading"
-                  className="flex flex-col border-t border-current/10 pb-2"
+                  aria-labelledby={isVisuallyCollapsed ? undefined : "hermes-sidebar-plugin-nav-heading"}
+                  className={cn(
+                    "flex flex-col border-t border-current/10",
+                    isVisuallyCollapsed ? "pb-0" : "pb-2",
+                  )}
                   role="group"
                 >
-                  <span
-                    className={cn(
-                      "px-5 pt-2.5 pb-1",
-                      "font-mondwest text-[0.6rem] tracking-[0.15em] uppercase opacity-30",
-                    )}
-                    id="hermes-sidebar-plugin-nav-heading"
-                  >
-                    {t.app.pluginNavSection}
-                  </span>
+                  {!isVisuallyCollapsed && (
+                    <span
+                      className={cn(
+                        "px-5 pt-2.5 pb-1",
+                        "font-mondwest text-[0.6rem] tracking-[0.15em] uppercase opacity-30",
+                      )}
+                      id="hermes-sidebar-plugin-nav-heading"
+                    >
+                      {t.app.pluginNavSection}
+                    </span>
+                  )}
 
                   <ul className="flex flex-col">
                     {sidebarNav.pluginItems.map((item) => (
                       <SidebarNavLink
                         closeMobile={closeMobile}
+                        collapsed={isVisuallyCollapsed}
                         item={item}
                         key={item.path}
                         t={t}
@@ -563,8 +608,9 @@ export default function App() {
               )}
             </nav>
 
-            <SidebarSystemActions onNavigate={closeMobile} />
+            <SidebarSystemActions collapsed={isVisuallyCollapsed} onNavigate={closeMobile} />
 
+            {!isVisuallyCollapsed && (
             <div
               className={cn(
                 "flex shrink-0 items-center justify-between gap-2",
@@ -578,8 +624,9 @@ export default function App() {
                 <LanguageSwitcher dropUp />
               </div>
             </div>
+            )}
 
-            <SidebarFooter />
+            {!isVisuallyCollapsed && <SidebarFooter />}
           </aside>
 
           <PageHeaderProvider pluginTabs={pluginTabMeta}>
@@ -654,7 +701,7 @@ export default function App() {
   );
 }
 
-function SidebarNavLink({ closeMobile, item, t }: SidebarNavLinkProps) {
+function SidebarNavLink({ closeMobile, collapsed, item, t }: SidebarNavLinkProps) {
   const { path, label, labelKey, icon: Icon } = item;
 
   const navLabel = labelKey
@@ -667,10 +714,11 @@ function SidebarNavLink({ closeMobile, item, t }: SidebarNavLinkProps) {
         to={path}
         end={path === "/sessions"}
         onClick={closeMobile}
+        title={collapsed ? navLabel : undefined}
         className={({ isActive }) =>
           cn(
-            "group relative flex items-center gap-3",
-            "px-5 py-2.5",
+            "group relative flex items-center",
+            collapsed ? "justify-center px-0 py-3" : "gap-3 px-5 py-2.5",
             "font-mondwest text-[0.8rem] tracking-[0.12em]",
             "whitespace-nowrap transition-colors cursor-pointer",
             "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-midground",
@@ -683,13 +731,15 @@ function SidebarNavLink({ closeMobile, item, t }: SidebarNavLinkProps) {
       >
         {({ isActive }) => (
           <>
-            <Icon className="h-3.5 w-3.5 shrink-0" />
-            <span className="truncate">{navLabel}</span>
+            <Icon className="h-4 w-4 shrink-0" />
+            {!collapsed && <span className="truncate">{navLabel}</span>}
 
-            <span
-              aria-hidden
-              className="absolute inset-y-0.5 left-1.5 right-1.5 bg-midground opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-5"
-            />
+            {!collapsed && (
+              <span
+                aria-hidden
+                className="absolute inset-y-0.5 left-1.5 right-1.5 bg-midground opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-5"
+              />
+            )}
 
             {isActive && (
               <span
@@ -705,7 +755,7 @@ function SidebarNavLink({ closeMobile, item, t }: SidebarNavLinkProps) {
   );
 }
 
-function SidebarSystemActions({ onNavigate }: { onNavigate: () => void }) {
+function SidebarSystemActions({ collapsed, onNavigate }: { collapsed: boolean; onNavigate: () => void }) {
   const { t } = useI18n();
   const navigate = useNavigate();
   const { activeAction, isBusy, isRunning, pendingAction, runAction } =
@@ -740,20 +790,23 @@ function SidebarSystemActions({ onNavigate }: { onNavigate: () => void }) {
       className={cn(
         "shrink-0 flex flex-col",
         "border-t border-current/10",
-        "py-1",
+        collapsed ? "py-1 items-center" : "py-1",
       )}
     >
-      <span
-        className={cn(
-          "px-5 pt-0.5 pb-0.5",
-          "font-mondwest text-[0.6rem] tracking-[0.15em] uppercase opacity-30",
-        )}
-      >
-        {t.app.system}
-      </span>
+      {!collapsed && (
+        <span
+          className={cn(
+            "px-5 pt-0.5 pb-0.5",
+            "font-mondwest text-[0.6rem] tracking-[0.15em] uppercase opacity-30",
+          )}
+        >
+          {t.app.system}
+        </span>
+      )}
 
-      <SidebarStatusStrip />
+      <SidebarStatusStrip collapsed={collapsed} />
 
+      {!collapsed && (
       <ul className="flex flex-col">
         {items.map(({ action, icon: Icon, label, runningLabel, spin }) => {
           const isPending = pendingAction === action;
@@ -812,6 +865,7 @@ function SidebarSystemActions({ onNavigate }: { onNavigate: () => void }) {
           );
         })}
       </ul>
+      )}
     </div>
   );
 }
@@ -825,6 +879,7 @@ interface NavItem {
 
 interface SidebarNavLinkProps {
   closeMobile: () => void;
+  collapsed: boolean;
   item: NavItem;
   t: Translations;
 }

@@ -74,6 +74,25 @@ function getInitialLocale(): Locale {
   } catch {
     // SSR or privacy mode
   }
+  try {
+    const lang = navigator.language;
+    if (lang.startsWith("zh")) return "zh";
+    if (lang.startsWith("ja")) return "ja";
+    if (lang.startsWith("ko")) return "ko";
+    if (lang.startsWith("de")) return "de";
+    if (lang.startsWith("es")) return "es";
+    if (lang.startsWith("fr")) return "fr";
+    if (lang.startsWith("ru")) return "ru";
+    if (lang.startsWith("uk")) return "uk";
+    if (lang.startsWith("tr")) return "tr";
+    if (lang.startsWith("pt")) return "pt";
+    if (lang.startsWith("hu")) return "hu";
+    if (lang.startsWith("it")) return "it";
+    if (lang.startsWith("af")) return "af";
+    if (lang.startsWith("ga")) return "ga";
+  } catch {
+    // SSR — navigator not available
+  }
   return "en";
 }
 

@@ -4,20 +4,45 @@ import { useSidebarStatus } from "@/hooks/useSidebarStatus";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
 
-/** Gateway + session summary for the System sidebar block (no separate strip chrome). */
-export function SidebarStatusStrip() {
+/** Gateway + session summary for the System sidebar block. When collapsed,
+ *  renders a minimal colored dot linking to /sessions. */
+export function SidebarStatusStrip({ collapsed = false }: { collapsed?: boolean }) {
   const status = useSidebarStatus();
   const { t } = useI18n();
 
   if (status === null) {
     return (
-      <div className="px-5 py-1.5" aria-hidden>
+      <div className={cn(collapsed ? "px-0 py-1.5" : "px-5 py-1.5")} aria-hidden>
         <div className="h-2 w-[80%] max-w-full animate-pulse rounded-sm bg-midground/10" />
       </div>
     );
   }
 
   const gw = gatewayLine(status, t);
+
+  if (collapsed) {
+    return (
+      <Link
+        to="/sessions"
+        title={`${t.app.gatewayStatusLabel} ${gw.label}\n${t.app.activeSessionsLabel} ${status.active_sessions}`}
+        className="block py-1.5"
+      >
+        <span
+          className={cn(
+            "block h-2 w-2 rounded-full",
+            gw.tone === "text-success"
+              ? "bg-green-500/70"
+              : gw.tone === "text-warning"
+                ? "bg-yellow-500/70"
+                : gw.tone === "text-destructive"
+                  ? "bg-red-500/70"
+                  : "bg-muted-foreground/40",
+          )}
+        />
+      </Link>
+    );
+  }
+
   const { activeSessionsLabel, gatewayStatusLabel } = t.app;
 
   return (
