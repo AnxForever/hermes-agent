@@ -165,6 +165,17 @@ youtube = [
   # at first invocation with ModuleNotFoundError (issue #22243).
   "youtube-transcript-api==1.2.4",
 ]
+# Data analysis stack — pandas + Excel/Parquet readers + matplotlib for charts.
+# Used by tools/data_tools.py (describe_dataset, plot_chart) and any
+# execute_code session that needs to slice DataFrames or render PNGs.
+# Pinned to exact versions per the no-ranges policy (see top of [dependencies]).
+data = [
+  "pandas==2.3.3",
+  "numpy==2.4.3",
+  "openpyxl==3.1.5",
+  "pyarrow==21.0.0",
+  "matplotlib==3.10.9",
+]
 # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
 web = ["fastapi==0.133.1", "uvicorn[standard]==0.41.0"]
 all = [
@@ -200,6 +211,7 @@ all = [
   "hermes-agent[google]",
   "hermes-agent[web]",
   "hermes-agent[youtube]",
+  "hermes-agent[data]",
 ]
 
 [project.scripts]
