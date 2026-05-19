@@ -75,36 +75,82 @@ _VALID_KINDS = {"line", "bar", "scatter", "hist", "box"}
 # ---------------------------------------------------------------------------
 
 
-def _validate_path(path: str) -> Tuple[bool, str, Optional[Path]]:
+def _list_cache_files(limit: int = 10) -> List[str]:
+    """List up-to-N recent files under /opt/data/cache for error hints."""
+    cache = _ALLOWED_ROOT / "cache"
+    if not cache.exists():
+        return []
+    try:
+        candidates = [p for p in cache.rglob("*") if p.is_file()]
+    except OSError:
+        return []
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return [str(p) for p in candidates[:limit]]
+
+
+def _error(message: str, hint: str = "") -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"success": False, "error": message}
+    if hint:
+        payload["hint"] = hint
+    return payload
+
+
+def _validate_path(path: str) -> Tuple[bool, str, str, Optional[Path]]:
+    """Return (ok, error, hint, resolved). Hint is a concrete next step."""
     if not path or not isinstance(path, str):
-        return False, "path must be a non-empty string", None
+        return (
+            False,
+            "path must be a non-empty string",
+            "pass an absolute path under /opt/data, e.g. /opt/data/cache/sales.xlsx",
+            None,
+        )
     try:
         resolved = Path(path).expanduser().resolve()
     except (OSError, RuntimeError) as exc:
-        return False, f"could not resolve path: {exc}", None
+        return False, f"could not resolve path: {exc}", "", None
     try:
         resolved.relative_to(_ALLOWED_ROOT)
     except ValueError:
-        return False, f"path must be inside {_ALLOWED_ROOT}", None
+        return (
+            False,
+            f"path must be inside {_ALLOWED_ROOT}",
+            "Feishu attachments land under /opt/data/cache/. Use that prefix.",
+            None,
+        )
     if not resolved.exists():
-        return False, f"file not found: {resolved}", None
+        recents = _list_cache_files(limit=5)
+        hint = (
+            "recent files under /opt/data/cache: " + ", ".join(recents)
+            if recents
+            else "no files found under /opt/data/cache yet — ask the user to "
+            "re-send the attachment via Feishu"
+        )
+        return False, f"file not found: {resolved}", hint, None
     if not resolved.is_file():
-        return False, f"path is not a regular file: {resolved}", None
+        return (
+            False,
+            f"path is not a regular file: {resolved}",
+            "point at a single data file, not a directory",
+            None,
+        )
     size = resolved.stat().st_size
     if size > _MAX_FILE_BYTES:
         return (
             False,
             f"file too large: {size} bytes exceeds {_MAX_FILE_BYTES} cap",
+            "ask the user to filter the file down to under 50 MB before sending, "
+            "or split it into multiple sheets/files",
             None,
         )
     suffix = resolved.suffix.lower()
     if suffix not in _READERS:
         return (
             False,
-            f"unsupported extension '{suffix}'; supported: {sorted(_READERS)}",
+            f"unsupported extension '{suffix}'",
+            f"convert the file to one of {sorted(_READERS)} first",
             None,
         )
-    return True, "", resolved
+    return True, "", "", resolved
 
 
 def _list_excel_sheets(path: Path) -> List[str]:
@@ -203,9 +249,9 @@ def _top_missing(df: pd.DataFrame, top: int = 5) -> List[Dict[str, Any]]:
 
 
 def describe_dataset_tool(path: str, sheet: Optional[str] = None) -> Dict[str, Any]:
-    ok, err, resolved = _validate_path(path)
+    ok, err, hint, resolved = _validate_path(path)
     if not ok or resolved is None:
-        return {"success": False, "error": err}
+        return _error(err, hint)
 
     try:
         df, sheet_names = _load_dataframe(
@@ -213,7 +259,16 @@ def describe_dataset_tool(path: str, sheet: Optional[str] = None) -> Dict[str, A
         )
     except Exception as exc:
         logger.exception("describe_dataset: failed to load %s", resolved)
-        return {"success": False, "error": f"failed to load file: {exc}"}
+        suffix = resolved.suffix.lower()
+        load_hint = (
+            f"check that the file is a valid {suffix} export. If it's an Excel "
+            "with multiple sheets, pass sheet='<name>'."
+        )
+        if "sheet" in str(exc).lower():
+            sheets = _list_excel_sheets(resolved)
+            if sheets:
+                load_hint = f"available sheets: {sheets} — pass sheet=<one of these>"
+        return _error(f"failed to load file: {exc}", load_hint)
 
     truncated = len(df) > _DEFAULT_ROW_LIMIT
     if truncated:
@@ -224,8 +279,11 @@ def describe_dataset_tool(path: str, sheet: Optional[str] = None) -> Dict[str, A
         head_records = [_jsonable(row) for row in head_records]
     except Exception as exc:
         logger.exception("describe_dataset: failed to serialize head")
-        head_records = []
-        return {"success": False, "error": f"failed to serialize sample rows: {exc}"}
+        return _error(
+            f"failed to serialize sample rows: {exc}",
+            "some column likely holds an unsupported object type — drop or "
+            "stringify it before calling describe_dataset again",
+        )
 
     dtypes = {str(col): str(dt) for col, dt in df.dtypes.items()}
 
@@ -283,35 +341,46 @@ def plot_chart_tool(
     title: Optional[str] = None,
     out_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    ok, err, resolved = _validate_path(path)
+    ok, err, hint, resolved = _validate_path(path)
     if not ok or resolved is None:
-        return {"success": False, "error": err}
+        return _error(err, hint)
 
     kind = (kind or "").lower().strip()
     if kind not in _VALID_KINDS:
-        return {
-            "success": False,
-            "error": f"kind must be one of {sorted(_VALID_KINDS)}, got '{kind}'",
-        }
+        return _error(
+            f"kind must be one of {sorted(_VALID_KINDS)}, got '{kind}'",
+            "pick line/bar/scatter for trends, hist for distributions, "
+            "box for spread comparisons",
+        )
     if kind != "hist" and not y:
-        return {"success": False, "error": f"kind={kind} requires 'y' column"}
+        return _error(
+            f"kind={kind} requires 'y' column",
+            "call describe_dataset first to see which numeric column to use as y",
+        )
 
     ok2, err2, out_resolved = _resolve_out_path(out_path)
     if not ok2 or out_resolved is None:
-        return {"success": False, "error": err2}
+        return _error(
+            err2,
+            "omit out_path to auto-generate one under /opt/data/cache/charts/",
+        )
 
     try:
         df, _ = _load_dataframe(resolved)
     except Exception as exc:
         logger.exception("plot_chart: failed to load %s", resolved)
-        return {"success": False, "error": f"failed to load file: {exc}"}
+        return _error(
+            f"failed to load file: {exc}",
+            "run describe_dataset on the same path first to confirm the file "
+            "is parseable",
+        )
 
     missing_cols = [c for c in [x, y, hue] if c and c not in df.columns]
     if missing_cols:
-        return {
-            "success": False,
-            "error": f"columns not found in dataset: {missing_cols}",
-        }
+        return _error(
+            f"columns not found in dataset: {missing_cols}",
+            f"available columns: {list(df.columns)}",
+        )
 
     rows_used = int(len(df))
 
@@ -334,7 +403,11 @@ def plot_chart_tool(
         fig.savefig(out_resolved, format="png")
     except Exception as exc:
         logger.exception("plot_chart: failed to render")
-        return {"success": False, "error": f"failed to render chart: {exc}"}
+        return _error(
+            f"failed to render chart: {exc}",
+            "common cause: y/x has non-numeric values for line/scatter — "
+            "aggregate the data with execute_code first, or switch kind",
+        )
     finally:
         plt.close("all")
 
