@@ -31,9 +31,13 @@ services:
       - "8642"
     volumes:
       - ~/.hermes:/opt/data
+      # Mount the team-config repo at the *same host path* so SOUL.md
+      # (which is a host symlink to ~/hermes-team-config/SOUL.md) resolves
+      # both inside and outside the container.
+      - ~/hermes-team-config:/home/anx4758/hermes-team-config:ro
     environment:
-      - HERMES_UID=${HERMES_UID:-10000}
-      - HERMES_GID=${HERMES_GID:-10000}
+      - HERMES_UID=${HERMES_UID:-1000}
+      - HERMES_GID=${HERMES_GID:-1000}
       # API server for dashboard communication (internal Docker network)
       - API_SERVER_HOST=0.0.0.0
       - API_SERVER_KEY=0d8dacaa8a7b8553608ad8d20d15a8157e64e7efd02992cf
@@ -65,9 +69,13 @@ services:
       - gateway
     volumes:
       - ~/.hermes:/opt/data
+      # Mount the team-config repo at the *same host path* so SOUL.md
+      # (which is a host symlink to ~/hermes-team-config/SOUL.md) resolves
+      # both inside and outside the container.
+      - ~/hermes-team-config:/home/anx4758/hermes-team-config:ro
     environment:
-      - HERMES_UID=${HERMES_UID:-10000}
-      - HERMES_GID=${HERMES_GID:-10000}
+      - HERMES_UID=${HERMES_UID:-1000}
+      - HERMES_GID=${HERMES_GID:-1000}
     # Bind 0.0.0.0 inside the container so Docker port mapping can forward
     # --host 0.0.0.0. Port mapped to 127.0.0.1:9119 on host for security.
     command: ["dashboard", "--host", "0.0.0.0", "--no-open", "--insecure"]

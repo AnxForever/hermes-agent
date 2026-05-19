@@ -2883,7 +2883,58 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = getattr(event.source, "chat_id", "") or "" if event.source else ""
         chat_lock = self._get_chat_lock(chat_id)
         async with chat_lock:
+            if await self._try_handle_slash_command(event, chat_id):
+                return
             await self.handle_message(event)
+
+    async def _try_handle_slash_command(
+        self, event: MessageEvent, chat_id: str
+    ) -> bool:
+        """Pre-dispatch slash commands without invoking the agent loop.
+
+        Returns True when the message was a recognized command and an
+        acknowledgement has been sent (so the caller must NOT fall through
+        to the agent pipeline). Returns False for non-command messages or
+        unrecognized commands.
+        """
+        text = (event.text or "").strip()
+        if not text.startswith("/"):
+            return False
+        try:
+            from gateway.platforms.feishu_commands import (
+                CommandContext,
+                RESET_MARKER,
+                dispatch,
+            )
+        except Exception:
+            logger.exception("[Feishu] Failed to import slash command module")
+            return False
+
+        source = event.source
+        ctx = CommandContext(
+            raw_text=text,
+            user_id=str(getattr(source, "user_id", "") or "") if source else "",
+            user_name=str(getattr(source, "user_name", "") or "") if source else "",
+            chat_id=chat_id,
+        )
+        result = await dispatch(ctx)
+        if result is None:
+            return False
+
+        if result.text == RESET_MARKER:
+            try:
+                if hasattr(self, "_session_states"):
+                    self._session_states.pop(chat_id, None)
+                if hasattr(self, "_chat_text_batches"):
+                    self._chat_text_batches.pop(chat_id, None)
+            except Exception:
+                logger.exception("[Feishu] /reset session cleanup failed")
+            ack = "✅ 会话已重置，下一条消息会以全新上下文开始。"
+            await self.send(chat_id=chat_id, content=ack)
+            return True
+
+        await self.send(chat_id=chat_id, content=result.text)
+        return True
 
     # =========================================================================
     # Processing status reactions
@@ -3062,6 +3113,54 @@ class FeishuAdapter(BasePlatformAdapter):
         if inbound_type == MessageType.TEXT and not text and not media_urls:
             logger.debug("[Feishu] Ignoring empty text message id=%s", message_id)
             return
+
+        # Fast-path: when a registered local slash command matches we don't
+        # need the full source profile + chat_info round-trips — both add
+        # 200-500ms of Feishu API latency each. Build a minimal context and
+        # dispatch directly. Falls through to the normal pipeline when the
+        # text is a slash but unrecognized.
+        if inbound_type == MessageType.COMMAND:
+            try:
+                from gateway.platforms.feishu_commands import (
+                    CommandContext,
+                    RESET_MARKER,
+                    dispatch,
+                    parse_command,
+                )
+            except Exception:
+                logger.exception("[Feishu] slash-command fast-path import failed")
+            else:
+                parsed = parse_command(text)
+                if parsed is not None:
+                    fast_chat_id = getattr(message, "chat_id", "") or ""
+                    fast_user_id = (
+                        getattr(sender_id, "user_id", None)
+                        or getattr(sender_id, "open_id", None)
+                        or getattr(sender_id, "union_id", None)
+                        or ""
+                    )
+                    ctx = CommandContext(
+                        raw_text=text,
+                        user_id=str(fast_user_id),
+                        chat_id=fast_chat_id,
+                    )
+                    result = await dispatch(ctx)
+                    if result is not None:
+                        if result.text == RESET_MARKER:
+                            try:
+                                if hasattr(self, "_session_states"):
+                                    self._session_states.pop(fast_chat_id, None)
+                                if hasattr(self, "_pending_text_batches"):
+                                    self._pending_text_batches.pop(fast_chat_id, None)
+                            except Exception:
+                                logger.exception("[Feishu] /reset cleanup failed")
+                            await self.send(
+                                chat_id=fast_chat_id,
+                                content="✅ 会话已重置，下一条消息会以全新上下文开始。",
+                            )
+                        else:
+                            await self.send(chat_id=fast_chat_id, content=result.text)
+                        return
 
         if inbound_type != MessageType.COMMAND:
             hint = _build_mention_hint(mentions)
