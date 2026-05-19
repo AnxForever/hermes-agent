@@ -101,8 +101,85 @@ async function getSessionToken(): Promise<string> {
   throw new Error("Session token not available — page must be served by the Hermes dashboard server");
 }
 
+// ---------------------------------------------------------------------------
+// Admin types — users & audit
+// ---------------------------------------------------------------------------
+
+export interface AdminUser {
+  user_id: string;
+  handle: string;
+  role: string;
+  created_at: number;
+  last_seen: number | null;
+  disabled: boolean;
+}
+
+export interface AdminAuditEvent {
+  id: number;
+  ts: number;
+  actor_id: string | null;
+  actor_handle: string | null;
+  action: string;
+  target_kind: string | null;
+  target_id: string | null;
+  payload: Record<string, unknown> | null;
+  ip: string | null;
+}
+
+export interface AdminUsersResponse {
+  users: AdminUser[];
+}
+
+export interface AdminAuditResponse {
+  events: AdminAuditEvent[];
+  limit: number;
+  offset: number;
+  total: number;
+}
+
+export interface AdminAuditQuery {
+  limit?: number;
+  offset?: number;
+  action?: string;
+  actor?: string;
+}
+
 export const api = {
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
+
+  // --- admin users -------------------------------------------------------
+  adminListUsers: () => fetchJSON<AdminUsersResponse>("/api/admin/users"),
+  adminCreateUser: (handle: string, password: string, role: string = "user") =>
+    fetchJSON<AdminUser>("/api/admin/users", {
+      method: "POST",
+      body: JSON.stringify({ handle, password, role }),
+      headers: { "Content-Type": "application/json" },
+    }),
+  adminPatchUser: (
+    userId: string,
+    patch: { role?: string; disabled?: boolean; password?: string },
+  ) =>
+    fetchJSON<AdminUser>(`/api/admin/users/${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+      headers: { "Content-Type": "application/json" },
+    }),
+  adminDeleteUser: (userId: string) =>
+    fetchJSON<{ user_id: string; deleted: boolean }>(
+      `/api/admin/users/${encodeURIComponent(userId)}`,
+      { method: "DELETE" },
+    ),
+
+  // --- admin audit -------------------------------------------------------
+  adminListAudit: (query: AdminAuditQuery = {}) => {
+    const qs = new URLSearchParams();
+    if (query.limit) qs.set("limit", String(query.limit));
+    if (query.offset) qs.set("offset", String(query.offset));
+    if (query.action) qs.set("action", query.action);
+    if (query.actor) qs.set("actor", query.actor);
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return fetchJSON<AdminAuditResponse>(`/api/admin/audit${suffix}`);
+  },
   getSessions: (limit = 20, offset = 0) =>
     fetchJSON<PaginatedSessions>(`/api/sessions?limit=${limit}&offset=${offset}`),
   getSessionMessages: (id: string) =>

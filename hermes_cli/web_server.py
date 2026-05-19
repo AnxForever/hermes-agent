@@ -726,6 +726,238 @@ async def admin_logout():
     return JSONResponse(status_code=202, content={"status": "accepted"})
 
 
+# ---------------------------------------------------------------------------
+# Admin: user management + audit log
+#
+# These mirror /v1/users and /v1/audit on the gateway but live on the
+# dashboard origin so the SPA can hit them without CORS or a second
+# auth surface. Both surfaces read the same SQLite file mounted from
+# ~/.hermes/response_store.db, so the logic is consistent regardless
+# of which API the operator hits.
+# ---------------------------------------------------------------------------
+
+
+def _require_admin(request: Request) -> Dict[str, Any]:
+    if not _has_valid_session_token(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    user = getattr(request.state, "user", None) or {}
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="admin role required")
+    return user
+
+
+def _audit_record(
+    request: Request,
+    *,
+    action: str,
+    target_kind: Optional[str] = None,
+    target_id: Optional[str] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Best-effort audit write from a dashboard handler."""
+    store = _open_auth_store()
+    if store is None:
+        return
+    try:
+        ip = request.headers.get("x-forwarded-for", "") or (
+            request.client.host if request.client else None
+        )
+        store.record_audit(
+            actor=getattr(request.state, "user", None) or {},
+            action=action,
+            target_kind=target_kind,
+            target_id=target_id,
+            payload=payload,
+            ip=(ip.split(",")[0].strip() if ip else None),
+        )
+    except Exception:
+        _log.debug("audit write failed for %s", action, exc_info=True)
+    finally:
+        store.close()
+
+
+def _user_to_dict(user) -> Dict[str, Any]:
+    return {
+        "user_id": user.user_id,
+        "handle": user.handle,
+        "role": user.role,
+        "created_at": user.created_at,
+        "last_seen": user.last_seen,
+        "disabled": user.disabled,
+    }
+
+
+class _AdminUserCreate(BaseModel):
+    handle: str
+    password: str
+    role: str = "user"
+
+
+class _AdminUserPatch(BaseModel):
+    role: Optional[str] = None
+    disabled: Optional[bool] = None
+    password: Optional[str] = None
+
+
+@app.get("/api/admin/users")
+async def admin_list_users(request: Request):
+    _require_admin(request)
+    store = _open_auth_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="AuthStore unavailable")
+    try:
+        users = [_user_to_dict(u) for u in store.list_users()]
+        return {"users": users}
+    finally:
+        store.close()
+
+
+@app.post("/api/admin/users")
+async def admin_create_user(request: Request, body: _AdminUserCreate):
+    _require_admin(request)
+    handle = body.handle.strip()
+    if not handle or not body.password:
+        raise HTTPException(status_code=400, detail="handle and password required")
+    if body.role not in {"user", "admin"}:
+        raise HTTPException(status_code=400, detail="role must be 'user' or 'admin'")
+    store = _open_auth_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="AuthStore unavailable")
+    try:
+        try:
+            user = store.create_user(
+                handle=handle, password=body.password, role=body.role
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        _audit_record(
+            request,
+            action="user.create",
+            target_kind="user",
+            target_id=user.user_id,
+            payload={"handle": handle, "role": body.role},
+        )
+        return JSONResponse(_user_to_dict(user), status_code=201)
+    finally:
+        store.close()
+
+
+@app.patch("/api/admin/users/{user_id}")
+async def admin_patch_user(user_id: str, request: Request, body: _AdminUserPatch):
+    admin = _require_admin(request)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+    store = _open_auth_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="AuthStore unavailable")
+    try:
+        target = store.get_user_by_id(user_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="user not found")
+
+        is_self = admin.get("user_id") == user_id
+        if is_self and body.role is not None and body.role != target.role:
+            raise HTTPException(
+                status_code=400, detail="cannot change your own role"
+            )
+        if is_self and body.disabled is True:
+            raise HTTPException(
+                status_code=400, detail="cannot disable your own account"
+            )
+
+        changes: Dict[str, Any] = {}
+        if body.password is not None:
+            if not body.password:
+                raise HTTPException(
+                    status_code=400, detail="password must be non-empty"
+                )
+            store.update_user_password(user_id, body.password)
+            changes["password"] = "***"
+        if body.role is not None:
+            if body.role not in {"user", "admin"}:
+                raise HTTPException(
+                    status_code=400, detail="role must be 'user' or 'admin'"
+                )
+            store.set_user_role(user_id, body.role)
+            changes["role"] = body.role
+        if body.disabled is not None:
+            store.set_user_disabled(user_id, bool(body.disabled))
+            changes["disabled"] = bool(body.disabled)
+        updated = store.get_user_by_id(user_id)
+        if changes:
+            _audit_record(
+                request,
+                action="user.patch",
+                target_kind="user",
+                target_id=user_id,
+                payload={"handle": target.handle, "changes": changes},
+            )
+        return _user_to_dict(updated)
+    finally:
+        store.close()
+
+
+@app.delete("/api/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, request: Request):
+    admin = _require_admin(request)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+    if admin.get("user_id") == user_id:
+        raise HTTPException(
+            status_code=400, detail="cannot delete your own account"
+        )
+    store = _open_auth_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="AuthStore unavailable")
+    try:
+        target = store.get_user_by_id(user_id)
+        deleted = store.delete_user(user_id)
+        _audit_record(
+            request,
+            action="user.delete",
+            target_kind="user",
+            target_id=user_id,
+            payload={
+                "handle": target.handle if target else None,
+                "deleted": deleted,
+            },
+        )
+        return {"user_id": user_id, "deleted": deleted}
+    finally:
+        store.close()
+
+
+@app.get("/api/admin/audit")
+async def admin_list_audit(request: Request):
+    _require_admin(request)
+    qs = request.query_params
+    try:
+        limit = int(qs.get("limit", 100))
+        offset = int(qs.get("offset", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400, detail="limit/offset must be integers"
+        )
+    store = _open_auth_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="AuthStore unavailable")
+    try:
+        rows = store.list_audit(
+            limit=limit,
+            offset=offset,
+            action_prefix=qs.get("action") or None,
+            actor_handle=qs.get("actor") or None,
+        )
+        return {
+            "events": rows,
+            "limit": limit,
+            "offset": offset,
+            "total": store.count_audit(),
+        }
+    finally:
+        store.close()
+
+
 @app.get("/api/status")
 async def get_status():
     current_ver, latest_ver = check_config_version()
