@@ -1337,6 +1337,153 @@ class APIServerAdapter(BasePlatformAdapter):
         deleted = self._auth_store.delete_mcp_server(name)
         return web.json_response({"name": name, "deleted": deleted})
 
+    # ---- /v1/users (admin-only) --------------------------------------
+
+    def _user_to_dict(self, user: "UserRecord") -> Dict[str, Any]:
+        return {
+            "user_id": user.user_id,
+            "handle": user.handle,
+            "role": user.role,
+            "created_at": user.created_at,
+            "last_seen": user.last_seen,
+            "disabled": user.disabled,
+        }
+
+    async def _handle_list_users(self, request: "web.Request") -> "web.Response":
+        _admin, err = self._require_admin(request)
+        if err is not None:
+            return err
+        if self._auth_store is None:
+            return self._auth_unavailable()
+        users = [self._user_to_dict(u) for u in self._auth_store.list_users()]
+        return web.json_response({"users": users})
+
+    async def _handle_create_user(self, request: "web.Request") -> "web.Response":
+        _admin, err = self._require_admin(request)
+        if err is not None:
+            return err
+        if self._auth_store is None:
+            return self._auth_unavailable()
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return web.json_response(
+                {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}},
+                status=400,
+            )
+        handle = str(body.get("handle") or "").strip()
+        password = body.get("password") or ""
+        role = str(body.get("role") or "user").strip() or "user"
+        if not handle or not password:
+            return web.json_response(
+                {"error": {"message": "handle and password required", "type": "invalid_request_error"}},
+                status=400,
+            )
+        if role not in {"user", "admin"}:
+            return web.json_response(
+                {"error": {"message": "role must be 'user' or 'admin'", "type": "invalid_request_error"}},
+                status=400,
+            )
+        try:
+            user = self._auth_store.create_user(
+                handle=handle, password=password, role=role
+            )
+        except ValueError as exc:
+            return web.json_response(
+                {"error": {"message": str(exc), "type": "invalid_request_error", "code": "duplicate_handle"}},
+                status=409,
+            )
+        return web.json_response(self._user_to_dict(user), status=201)
+
+    async def _handle_patch_user(self, request: "web.Request") -> "web.Response":
+        admin, err = self._require_admin(request)
+        if err is not None:
+            return err
+        if self._auth_store is None:
+            return self._auth_unavailable()
+        user_id = request.match_info.get("user_id", "").strip()
+        if not user_id:
+            return web.json_response(
+                {"error": {"message": "user_id required", "type": "invalid_request_error"}},
+                status=400,
+            )
+        target = self._auth_store.get_user_by_id(user_id)
+        if target is None:
+            return web.json_response(
+                {"error": {"message": "user not found", "type": "not_found"}},
+                status=404,
+            )
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return web.json_response(
+                {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        # Self-protection: an admin can't demote or disable themselves
+        # via this endpoint. They'd lock everyone else out and then
+        # bricked their own access. Bootstrap-via-env is the recovery
+        # path for that, so we keep this guard simple and visible.
+        is_self = admin.get("user_id") == user_id
+        new_role = body.get("role")
+        new_disabled = body.get("disabled")
+        if is_self and new_role is not None and new_role != target.role:
+            return web.json_response(
+                {"error": {"message": "cannot change your own role", "type": "invalid_request_error"}},
+                status=400,
+            )
+        if is_self and new_disabled is True:
+            return web.json_response(
+                {"error": {"message": "cannot disable your own account", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        new_password = body.get("password")
+        if new_password is not None:
+            if not isinstance(new_password, str) or not new_password:
+                return web.json_response(
+                    {"error": {"message": "password must be a non-empty string", "type": "invalid_request_error"}},
+                    status=400,
+                )
+            self._auth_store.update_user_password(user_id, new_password)
+        if new_role is not None:
+            if new_role not in {"user", "admin"}:
+                return web.json_response(
+                    {"error": {"message": "role must be 'user' or 'admin'", "type": "invalid_request_error"}},
+                    status=400,
+                )
+            self._auth_store.set_user_role(user_id, new_role)
+        if new_disabled is not None:
+            if not isinstance(new_disabled, bool):
+                return web.json_response(
+                    {"error": {"message": "disabled must be boolean", "type": "invalid_request_error"}},
+                    status=400,
+                )
+            self._auth_store.set_user_disabled(user_id, new_disabled)
+        updated = self._auth_store.get_user_by_id(user_id)
+        return web.json_response(self._user_to_dict(updated))
+
+    async def _handle_delete_user(self, request: "web.Request") -> "web.Response":
+        admin, err = self._require_admin(request)
+        if err is not None:
+            return err
+        if self._auth_store is None:
+            return self._auth_unavailable()
+        user_id = request.match_info.get("user_id", "").strip()
+        if not user_id:
+            return web.json_response(
+                {"error": {"message": "user_id required", "type": "invalid_request_error"}},
+                status=400,
+            )
+        if admin.get("user_id") == user_id:
+            return web.json_response(
+                {"error": {"message": "cannot delete your own account", "type": "invalid_request_error"}},
+                status=400,
+            )
+        deleted = self._auth_store.delete_user(user_id)
+        return web.json_response({"user_id": user_id, "deleted": deleted})
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
@@ -3854,6 +4001,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/mcp/servers", self._handle_list_mcp)
             self._app.router.add_post("/v1/mcp/servers", self._handle_upsert_mcp)
             self._app.router.add_delete("/v1/mcp/servers/{name}", self._handle_delete_mcp)
+            # User management (admin-only)
+            self._app.router.add_get("/v1/users", self._handle_list_users)
+            self._app.router.add_post("/v1/users", self._handle_create_user)
+            self._app.router.add_patch("/v1/users/{user_id}", self._handle_patch_user)
+            self._app.router.add_delete("/v1/users/{user_id}", self._handle_delete_user)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)

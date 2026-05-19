@@ -241,6 +241,10 @@ def _build_app(tmp_path, *, api_key="test-key-xyz"):
     app.router.add_delete(
         "/v1/mcp/servers/{name}", adapter._handle_delete_mcp
     )
+    app.router.add_get("/v1/users", adapter._handle_list_users)
+    app.router.add_post("/v1/users", adapter._handle_create_user)
+    app.router.add_patch("/v1/users/{user_id}", adapter._handle_patch_user)
+    app.router.add_delete("/v1/users/{user_id}", adapter._handle_delete_user)
     return adapter, app
 
 
@@ -440,3 +444,151 @@ class TestMCP:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert (await resp2.json())["deleted"] is False
+
+
+class TestUsersCrud:
+    async def _admin(self, cli):
+        login = await _login(cli, "root", "root-pw")
+        return (await login.json())["access_token"], (await login.json())["user"][
+            "user_id"
+        ]
+
+    async def test_list_users_admin_only(self, client):
+        _, cli = client
+        token, _admin_id = await self._admin(cli)
+        resp = await cli.get(
+            "/v1/users", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert resp.status == 200
+        handles = {u["handle"] for u in (await resp.json())["users"]}
+        assert handles >= {"alice", "root"}
+
+    async def test_list_users_forbidden_for_regular_user(self, client):
+        _, cli = client
+        login = await _login(cli, "alice", "alice-pw")
+        token = (await login.json())["access_token"]
+        resp = await cli.get(
+            "/v1/users", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert resp.status == 403
+
+    async def test_create_and_login_new_user(self, client):
+        _, cli = client
+        token, _ = await self._admin(cli)
+        resp = await cli.post(
+            "/v1/users",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"handle": "carol", "password": "carolpw", "role": "user"},
+        )
+        assert resp.status == 201
+        # New user can log in immediately
+        login = await _login(cli, "carol", "carolpw")
+        assert login.status == 200
+
+    async def test_create_user_duplicate_handle_returns_409(self, client):
+        _, cli = client
+        token, _ = await self._admin(cli)
+        resp = await cli.post(
+            "/v1/users",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"handle": "alice", "password": "x"},
+        )
+        assert resp.status == 409
+
+    async def test_create_user_validates_role(self, client):
+        _, cli = client
+        token, _ = await self._admin(cli)
+        resp = await cli.post(
+            "/v1/users",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"handle": "evil", "password": "x", "role": "superadmin"},
+        )
+        assert resp.status == 400
+
+    async def test_patch_disabled_blocks_login(self, client):
+        adapter, cli = client
+        token, _ = await self._admin(cli)
+        alice = adapter._auth_store.get_user_by_handle("alice")
+        # disable
+        resp = await cli.patch(
+            f"/v1/users/{alice.user_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"disabled": True},
+        )
+        assert resp.status == 200
+        # alice login → 401
+        resp2 = await cli.post(
+            "/v1/auth/login", json={"handle": "alice", "password": "alice-pw"}
+        )
+        assert resp2.status == 401
+
+    async def test_patch_password_resets(self, client):
+        adapter, cli = client
+        token, _ = await self._admin(cli)
+        alice = adapter._auth_store.get_user_by_handle("alice")
+        await cli.patch(
+            f"/v1/users/{alice.user_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"password": "new-alice-pw"},
+        )
+        # old pw fails
+        assert (
+            await cli.post(
+                "/v1/auth/login",
+                json={"handle": "alice", "password": "alice-pw"},
+            )
+        ).status == 401
+        # new pw works
+        assert (
+            await cli.post(
+                "/v1/auth/login",
+                json={"handle": "alice", "password": "new-alice-pw"},
+            )
+        ).status == 200
+
+    async def test_self_protection_demote(self, client):
+        _, cli = client
+        token, admin_id = await self._admin(cli)
+        resp = await cli.patch(
+            f"/v1/users/{admin_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"role": "user"},
+        )
+        assert resp.status == 400
+
+    async def test_self_protection_disable(self, client):
+        _, cli = client
+        token, admin_id = await self._admin(cli)
+        resp = await cli.patch(
+            f"/v1/users/{admin_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"disabled": True},
+        )
+        assert resp.status == 400
+
+    async def test_self_protection_delete(self, client):
+        _, cli = client
+        token, admin_id = await self._admin(cli)
+        resp = await cli.delete(
+            f"/v1/users/{admin_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status == 400
+
+    async def test_delete_cascades_skill_overrides(self, client):
+        adapter, cli = client
+        token, _ = await self._admin(cli)
+        alice = adapter._auth_store.get_user_by_handle("alice")
+        adapter._auth_store.set_skill_override(
+            user_id=alice.user_id, skill_name="kb", enabled=False
+        )
+        # delete alice
+        resp = await cli.delete(
+            f"/v1/users/{alice.user_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status == 200
+        assert adapter._auth_store.get_user_by_id(alice.user_id) is None
+        assert (
+            adapter._auth_store.get_skill_overrides(alice.user_id) == {}
+        )

@@ -455,6 +455,47 @@ class AuthStore:
         ).fetchall()
         return [_row_to_user(r) for r in rows]
 
+    def update_user_password(self, user_id: str, new_password: str) -> bool:
+        """Reset a user's password hash. Returns True if a row was changed."""
+        cur = self._conn.execute(
+            "UPDATE users SET password_hash = ? WHERE user_id = ?",
+            (hash_password(new_password), user_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_user_role(self, user_id: str, role: str) -> bool:
+        cur = self._conn.execute(
+            "UPDATE users SET role = ? WHERE user_id = ?", (role, user_id)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_user_disabled(self, user_id: str, disabled: bool) -> bool:
+        cur = self._conn.execute(
+            "UPDATE users SET disabled = ? WHERE user_id = ?",
+            (1 if disabled else 0, user_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def delete_user(self, user_id: str) -> bool:
+        """Delete a user + cascade their skill overrides.
+
+        MCP server entries are scoped globally so they are NOT cascaded —
+        admin-installed servers survive a user delete.
+        """
+        # Remove dependent rows first to keep referential intent honest
+        # even though we don't declare FK constraints.
+        self._conn.execute(
+            "DELETE FROM user_skill_overrides WHERE user_id = ?", (user_id,)
+        )
+        cur = self._conn.execute(
+            "DELETE FROM users WHERE user_id = ?", (user_id,)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
     # -- skill overrides --------------------------------------------
 
     def set_skill_override(
