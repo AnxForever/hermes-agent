@@ -70,6 +70,8 @@ _HERMES_CORE_TOOLS = [
     "kanban_unblock",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Data analysis (pandas + matplotlib via tools/data_tools.py)
+    "describe_dataset", "plot_chart",
 ]
 
 
