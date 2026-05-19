@@ -103,6 +103,107 @@ Roles: `user` (default) for chat-only access; `admin` to also reach
 `/v1/mcp/servers`. The role string is free-form — only `"admin"` has
 elevated checks today.
 
+## Admin dashboard RBAC (opt-in)
+
+By default the admin dashboard (`web/`, port 9119) trusts an ephemeral
+session token injected into its HTML — fine for a single operator on
+localhost, brittle once you have teammates. Flip the gate by exporting
+`HERMES_DASHBOARD_REQUIRE_LOGIN=1` before `docker compose up`:
+
+```bash
+HERMES_DASHBOARD_REQUIRE_LOGIN=1 \
+HERMES_BOOTSTRAP_ADMIN_PASSWORD=<your-pwd> \
+HERMES_UID=$(id -u) HERMES_GID=$(id -g) \
+  docker compose up -d --build
+```
+
+The dashboard server now:
+
+- **Refuses** the legacy session token on `/api/*`. A 401 there bounces
+  the SPA to `/login.html`.
+- **Accepts** `Authorization: Bearer <JWT>` issued by either
+  `POST /api/admin/login` (same origin) or `POST /v1/auth/login` (gateway).
+  Both servers verify against the shared `API_SERVER_KEY`, so a JWT minted
+  on one works on the other.
+- Logs every admin write to `audit_log` (see Users/Audit pages below).
+
+### First-time admin
+
+The compose file passes `HERMES_BOOTSTRAP_ADMIN_PASSWORD` (default
+`darling`) into the gateway. On first start, if the `users` table is
+empty, that env value creates `admin` with role `admin`. Sign in at
+`http://127.0.0.1:9119/login.html` and rotate the password from
+`/users` (see below) — the env var is only consumed when the table is
+empty and is ignored afterwards.
+
+### Adding teammates
+
+`/users` (Shield icon in the sidebar) is the SPA front for
+`/api/admin/users`:
+
+- **New user** → handle + password + role (`user` or `admin`)
+- **Role** select on each row — gated against self-demotion
+- **Reset password** prompts inline (sends `PATCH {password: ...}`)
+- **Disable / Enable** flips the `disabled` flag — disabled accounts get
+  a 401 from `/v1/auth/login` *and* `/api/admin/login`, so they're locked
+  out of both surfaces at once
+- **Delete** cascades the user's row in `user_skill_overrides` so their
+  toggles don't strand. MCP servers are global scope and survive.
+
+Self-protection: you can't change your own role, disable yourself, or
+delete yourself. If every admin somehow gets locked out, recovery is to
+drop the row from `users` directly:
+
+```bash
+docker exec hermes /opt/hermes/.venv/bin/python3 -c '
+from hermes_cli.config import get_hermes_home
+import sqlite3
+db = str(get_hermes_home() / "response_store.db")
+sqlite3.connect(db).execute("DELETE FROM users WHERE handle=?", ("admin",)).connection.commit()
+'
+# Then restart with HERMES_BOOTSTRAP_ADMIN_PASSWORD set.
+docker compose restart gateway
+```
+
+### Audit log
+
+`/audit` (Eye icon) is the SPA front for `/api/admin/audit`. Every
+admin write surface logs a row:
+
+| Action | Captured payload |
+|--------|------------------|
+| `user.create` | `{handle, role}` |
+| `user.patch` | `{handle, changes: {role?, disabled?, password: "***"}}` |
+| `user.delete` | `{handle, deleted}` |
+| `mcp.upsert` | `{command, args, enabled}` |
+| `mcp.delete` | `{deleted}` |
+| `skill.toggle` | `{enabled}` |
+| `upload.create` | `{size, original_name, extension}` |
+
+Filters: action prefix (e.g. `user.delete` or `mcp.`) + actor handle.
+Pagination is 50 rows per page; the table sticks the header so you can
+scroll without losing the column names. Each row's payload is rendered
+inline as pretty-printed JSON.
+
+### JWT lifecycle
+
+- Tokens live for 12 h (see `JWT_TTL_SECONDS` in `api_auth.py`).
+- The dashboard's SPA stores the JWT under `localStorage['hermes.admin_jwt']`
+  and sends it as `Authorization: Bearer …` on every `/api/*` request.
+- If any `/api/*` call returns 401 (token expired, server restarted with a
+  rotated `API_SERVER_KEY`, account disabled), the SPA clears the stored
+  JWT and redirects to `/login.html`.
+- `POST /api/admin/logout` is a courtesy — the server holds no blocklist;
+  it just lets the SPA confirm a no-op succeeded before clearing storage.
+
+### Legacy session-token mode is still available
+
+If `HERMES_DASHBOARD_REQUIRE_LOGIN` is unset, the dashboard injects the
+session token into HTML as before and treats unauthenticated browsers as
+the implicit `_session_token_` admin. JWT login still works in this mode;
+the two paths coexist. Flip the env var when you're ready to move
+production to RBAC — no further code changes needed.
+
 ## Auth model
 
 Two bearers are accepted on every `/v1/*` endpoint:
@@ -221,3 +322,7 @@ also raise `client_max_body_size` in the nginx config to match.
 | Streaming SSE client | `web-chat/src/lib/api.ts` (`streamChatCompletion`) |
 | nginx reverse-proxy config | `docker/nginx/web-chat.conf` |
 | End-to-end regression script | `scripts/smoke_v1_api.sh` |
+| Admin login page (no React) | `web/public/login.html` |
+| Admin Users / Audit SPA pages | `web/src/pages/UsersAdminPage.tsx`, `web/src/pages/AuditAdminPage.tsx` |
+| Dashboard admin endpoints | `hermes_cli/web_server.py:/api/admin/*` |
+| Playwright E2E suite | `tests/e2e-web/` |
